@@ -111,6 +111,9 @@ def build_fracture_canvas(SO: SoftObject, fracture_info: Dict[str, List[int]]) -
     for c in cols:
         if c < 0 or c >= SO.cols:
             continue
+        if hasattr(SO, "active"):
+            if not (SO.active[r, c] and SO.active[r + 1, c]):
+                continue
         pts.append(SO.pos[r, c])
         pts.append(SO.pos[r + 1, c])
         pts.append(np.array([np.nan, np.nan]))
@@ -220,6 +223,68 @@ def _update_texture_mesh(mesh, pos: np.ndarray):
         mesh.stale = True
 
 
+def _select_shape_mask(rows: int, cols: int, edge_len: float) -> Optional[np.ndarray]:
+    if plt is None:
+        raise ImportError("形状选择需要 matplotlib，请先安装 matplotlib。")
+    try:
+        from matplotlib.widgets import LassoSelector
+        from matplotlib.path import Path
+    except Exception as exc:
+        raise ImportError("形状选择需要 matplotlib.widgets 支持。") from exc
+
+    x = np.arange(cols, dtype=np.float64) * edge_len
+    y = np.arange(rows, dtype=np.float64) * edge_len
+    X, Y = np.meshgrid(x, y, indexing="xy")
+    pts = np.stack([X.ravel(), Y.ravel()], axis=1)
+
+    was_interactive = plt.isinteractive()
+    plt.ioff()
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.1, max(rows, cols) * edge_len + 0.1)
+    ax.set_ylim(-0.1, max(rows, cols) * edge_len + 0.1)
+    ax.scatter(pts[:, 0], pts[:, 1], s=4, c="0.7")
+    ax.set_title("拖拽选择形状，按 Enter 确认，按 Esc 重置")
+    selected_scatter = ax.scatter([], [], s=6, c="C0")
+    state = {"mask": None}
+
+    def onselect(verts):
+        path = Path(verts)
+        mask = path.contains_points(pts).reshape(rows, cols)
+        state["mask"] = mask
+        sel_pts = pts[mask.ravel()]
+        selected_scatter.set_offsets(sel_pts)
+        fig.canvas.draw_idle()
+
+    def on_key(event):
+        if event.key == "enter":
+            plt.close(fig)
+        elif event.key == "escape":
+            state["mask"] = None
+            selected_scatter.set_offsets(np.empty((0, 2)))
+            fig.canvas.draw_idle()
+
+    lasso = LassoSelector(ax, onselect)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    plt.show()
+    lasso.disconnect_events()
+    if was_interactive:
+        plt.ion()
+    return state["mask"]
+
+
+def _compute_fixed_points(rows: int, cols: int, num_fixed: int, active_mask: Optional[np.ndarray]) -> np.ndarray:
+    if active_mask is None:
+        return np.stack([np.arange(1, num_fixed + 1), np.ones(num_fixed, dtype=int)], axis=1)
+    active_idx = np.argwhere(active_mask)
+    if active_idx.size == 0:
+        raise ValueError("选择区域为空，无法生成固定点。")
+    order = np.lexsort((active_idx[:, 0], active_idx[:, 1]))
+    active_idx = active_idx[order]
+    chosen = active_idx[: min(num_fixed, active_idx.shape[0])]
+    return chosen + 1  # 转为 1-based
+
+
 def apply_mouse_force(
     SO: SoftObject, inter: Optional[MouseInteractor], drag_k: float, pin_drag: bool = False
 ) -> Optional[Tuple[int, int]]:
@@ -231,6 +296,9 @@ def apply_mouse_force(
 
     r, c = inter.selected_idx
     if r < 0 or r >= SO.rows or c < 0 or c >= SO.cols:
+        return None
+
+    if hasattr(SO, "active") and not SO.active[r, c]:
         return None
 
     SO.clear_force_ext(r, c)  # 默认清空上一帧力
@@ -267,6 +335,12 @@ def run_sim(args):
         grid_alpha = 0.0 if args.texture and args.draw_mode == "full" else 1.0
     grid_alpha = float(np.clip(grid_alpha, 0.0, 1.0))
 
+    active_mask = None
+    if args.select_shape:
+        active_mask = _select_shape_mask(row, col, edge_len)
+        if active_mask is not None and not np.any(active_mask):
+            raise ValueError("选择区域为空，无法开始仿真。")
+
     # 固定点：左边缘若干节点（与 MATLAB 一致）
     if row >= 50:
         num_fixed = 15
@@ -274,9 +348,9 @@ def run_sim(args):
         num_fixed = 10
     else:
         num_fixed = 5
-    pt_fixed_idx = np.stack([np.arange(1, num_fixed + 1), np.ones(num_fixed, dtype=int)], axis=1)
+    pt_fixed_idx = _compute_fixed_points(row, col, num_fixed, active_mask)
 
-    SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx)
+    SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx, active_mask=active_mask)
     fracture_info = build_fracture(SO, row, col)
 
     fig, ax = None, None
@@ -307,6 +381,9 @@ def run_sim(args):
             alpha = float(np.clip(args.texture_alpha, 0.0, 1.0))
             if alpha < 1.0:
                 tex_colors[..., 3] *= alpha
+            if active_mask is not None:
+                tex_colors = tex_colors.copy()
+                tex_colors[~active_mask] = 0.0
             texture_mesh = ax.pcolormesh(
                 SO.pos[..., 0],
                 SO.pos[..., 1],
@@ -450,6 +527,11 @@ def main():
         type=float,
         default=None,
         help="网格线透明度 (0~1)，默认在 full 模式且启用纹理时为 0",
+    )
+    parser.add_argument(
+        "--select-shape",
+        action="store_true",
+        help="运行前使用鼠标选择形状（需 matplotlib）",
     )
     parser.add_argument("--show", action="store_true", help="开启 Matplotlib 动画（默认仅计算不绘图）")
     args = parser.parse_args()

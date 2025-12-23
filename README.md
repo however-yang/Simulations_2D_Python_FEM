@@ -24,6 +24,7 @@
 - 📊 **多种渲染模式**：完整网格、仅边界、仅节点
 - 🔨 **裂缝模拟**：支持预设裂缝，可视化断裂效果
 - 🖼️ **纹理贴图**：支持在 2D 网格上贴图并随形变更新
+- ✂️ **形状选择**：运行前用鼠标圈选非矩形形状
 - ⚡ **高性能计算**：优化的 NumPy 向量化操作
 
 ## 📦 安装
@@ -88,6 +89,9 @@ python3 main.py --show --texture ./texture.png --steps 2000
 
 # 贴图纹理且隐藏网格线（可选设置）
 python3 main.py --show --texture ./texture.png --grid-alpha 0 --steps 2000
+
+# 运行前圈选形状（按 Enter 确认）
+python3 main.py --show --select-shape --steps 2000
 ```
 
 ## ⚙️ 参数说明
@@ -127,6 +131,7 @@ python3 main.py --show --texture ./texture.png --grid-alpha 0 --steps 2000
 | `--texture-alpha` | 纹理透明度 | 1.0 | 0~1 |
 | `--texture-repeat` | 纹理平铺次数 | 1 | 正整数 |
 | `--grid-alpha` | 网格线透明度 | 自动 | 0~1 |
+| `--select-shape` | 运行前鼠标圈选形状 | False | True/False |
 
 ### 交互参数
 
@@ -157,6 +162,12 @@ python3 main.py --show --texture ./texture.png --grid-alpha 0 --steps 2000
 - `build_fracture` 函数按 MATLAB 规则修改 `conn_mode`
 - 绘图时以白线标出断裂位置
 - 裂缝位置根据网格大小自适应调整
+
+### 形状选择说明
+
+- 运行时会弹出选择窗口，按住鼠标拖拽圈选区域
+- 按 Enter 确认，按 Esc 重置
+- 非矩形形状建议使用 `full`/`points` 模式
 
 ### 数值积分
 

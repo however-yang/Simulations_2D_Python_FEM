@@ -16,6 +16,7 @@ class SoftObject:
         k: float,
         damping: float,
         pt_fixed_idx: Optional[np.ndarray],
+        active_mask: Optional[np.ndarray] = None,
     ):
         self.cols = int(cols)
         self.rows = int(rows)
@@ -23,6 +24,9 @@ class SoftObject:
         self.k_map = np.full((self.rows, self.cols), float(k), dtype=np.float64)
         self.damping_map = np.full((self.rows, self.cols), float(damping), dtype=np.float64)
         self._init_state(pt_fixed_idx)
+        self.active = np.ones((self.rows, self.cols), dtype=bool)
+        if active_mask is not None:
+            self.set_active_mask(active_mask, rebuild=False)
         self._init_conn_masks()
 
     # ------------------------------------------------------------------ 初始化
@@ -95,6 +99,15 @@ class SoftObject:
             self.offset_masks[off] = mask
         self._build_draw_edges()
 
+    def set_active_mask(self, mask: np.ndarray, rebuild: bool = True):
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.rows, self.cols):
+            raise ValueError("active_mask shape must match (rows, cols).")
+        self.active = mask
+        self.fixed_mode &= self.active
+        if rebuild:
+            self._init_conn_masks()
+
     def _build_draw_edges(self):
         """预计算可绘制的线段（只保存右/上方向，避免重复）。"""
         start_idx: List[int] = []
@@ -107,6 +120,9 @@ class SoftObject:
         for dr, dc in [(0, 1), (1, 0)]:
             neigh_mask = self._shift_with_mask(ones, dr, dc)[1]
             valid = self.offset_masks[(dr, dc)] & neigh_mask
+            if hasattr(self, "active"):
+                neigh_active, _ = self._shift_with_mask(self.active, dr, dc)
+                valid &= self.active & neigh_active
             r_idx, c_idx = np.nonzero(valid)
             for r, c in zip(r_idx.tolist(), c_idx.tolist()):
                 start_idx.append(flat(r, c))
@@ -121,9 +137,13 @@ class SoftObject:
     def update_soft_object(self, mass: float, ts: float):
         force_k = self._compute_force_k()
         force_total = force_k - self.damping_map[..., None] * self.vel + self.force_ext
+        if hasattr(self, "active"):
+            force_total[~self.active] = 0.0
         self.force = force_total
 
         movable = ~self.fixed_mode
+        if hasattr(self, "active"):
+            movable &= self.active
         mask3 = movable[..., None]
 
         acc_new = force_total / mass
@@ -151,6 +171,9 @@ class SoftObject:
             neigh_init, _ = self._shift_with_mask(self.pos_init, dr, dc)
 
             valid = mode_mask & neigh_mask
+            if hasattr(self, "active"):
+                neigh_active, _ = self._shift_with_mask(self.active, dr, dc)
+                valid &= self.active & neigh_active
             if not np.any(valid):
                 continue
 
@@ -207,6 +230,8 @@ class SoftObject:
         return seg.reshape(-1, 2)
 
     def drawSoftObjectContour(self) -> np.ndarray:
+        if hasattr(self, "active") and not np.all(self.active):
+            return self.drawSoftObject()
         max_points = (self.cols + self.rows) * 2
         canvas = np.zeros((max_points, 2), dtype=np.float64)
         idx = 0
@@ -225,12 +250,18 @@ class SoftObject:
         return canvas[:idx]
 
     def drawSoftObjectPt(self) -> np.ndarray:
+        if hasattr(self, "active"):
+            return self.pos[self.active]
         return self.pos.reshape(-1, 2)
 
     def find_closest_node(self, x: float, y: float) -> Tuple[int, int]:
         target = np.array([x, y], dtype=np.float64)
         diff = self.pos - target
         dist2 = (diff * diff).sum(axis=2)
+        if hasattr(self, "active"):
+            if not np.any(self.active):
+                return -1, -1
+            dist2 = np.where(self.active, dist2, np.inf)
         flat_idx = np.argmin(dist2)
         r = int(flat_idx // self.cols)
         c = int(flat_idx % self.cols)
@@ -247,4 +278,3 @@ class SoftObject:
     def set_conn_mode(self, r: int, c: int, mode: int):
         self.conn_mode[r, c] = mode
         self._init_conn_masks()
-
