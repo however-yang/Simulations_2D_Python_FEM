@@ -201,7 +201,10 @@ python3 main.py --renderer cuda --draw-mode texture --texture ./texture.png --st
 
 - 运行时会弹出选择窗口，按住鼠标拖拽圈选区域
 - 按 Enter 确认，按 Esc 重置
-- 非矩形形状建议使用 `full`/`points` 模式
+- 选择结果会生成 `active_mask`，仿真只对选中节点计算弹簧力/阻尼/外力
+- 固定点会自动选在选区最左侧节点，避免悬空
+- 绘制仅显示选中区域；纹理模式会把非选区透明
+- CUDA 纹理模式仅对选中区域内的完整网格单元生成三角面片
 
 ### 数值积分
 

@@ -597,8 +597,8 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=50)
-    parser.add_argument("--cols", type=int, default=50)
+    parser.add_argument("--rows", type=int, default=100)
+    parser.add_argument("--cols", type=int, default=100)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)
