@@ -119,6 +119,106 @@ def build_fracture_canvas(SO: SoftObject, fracture_info: Dict[str, List[int]]) -
     return np.stack(pts, axis=0)
 
 
+def _make_checker_texture(size: int = 256, tiles: int = 8) -> np.ndarray:
+    size = max(2, int(size))
+    tiles = max(1, int(tiles))
+    tile = max(1, size // tiles)
+    y = np.arange(size)[:, None] // tile
+    x = np.arange(size)[None, :] // tile
+    mask = (x + y) % 2
+    color_a = np.array([0.92, 0.92, 0.92, 1.0], dtype=np.float32)
+    color_b = np.array([0.18, 0.18, 0.18, 1.0], dtype=np.float32)
+    return np.where(mask[..., None] == 0, color_a, color_b)
+
+
+def _normalize_texture_image(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=2)
+    if img.shape[2] == 3:
+        alpha = np.ones((*img.shape[:2], 1), dtype=img.dtype)
+        img = np.concatenate([img, alpha], axis=2)
+    elif img.shape[2] != 4:
+        raise ValueError("Texture image must have 1, 3 or 4 channels.")
+
+    if np.issubdtype(img.dtype, np.integer):
+        img = img.astype(np.float32) / 255.0
+    else:
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img /= 255.0
+    return np.clip(img, 0.0, 1.0)
+
+
+def _load_texture_image(texture_path: str) -> np.ndarray:
+    if texture_path == "checker":
+        return _make_checker_texture()
+    from matplotlib import image as mpimg
+
+    img = mpimg.imread(texture_path)
+    return _normalize_texture_image(img)
+
+
+def _sample_texture(
+    img: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    repeat: int = 1,
+    flip_v: bool = True,
+) -> np.ndarray:
+    if flip_v:
+        v = 1.0 - v
+    repeat = max(1, int(repeat))
+    if repeat > 1:
+        u = (u * repeat) % 1.0
+        v = (v * repeat) % 1.0
+
+    h, w, _ = img.shape
+    x = u * (w - 1)
+    y = v * (h - 1)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+
+    dx = (x - x0)[..., None]
+    dy = (y - y0)[..., None]
+    c00 = img[y0, x0]
+    c01 = img[y0, x1]
+    c10 = img[y1, x0]
+    c11 = img[y1, x1]
+    c0 = c00 * (1.0 - dx) + c01 * dx
+    c1 = c10 * (1.0 - dx) + c11 * dx
+    return c0 * (1.0 - dy) + c1 * dy
+
+
+def _build_texture_colors(
+    rows: int,
+    cols: int,
+    texture: np.ndarray,
+    repeat: int = 1,
+    flip_v: bool = True,
+) -> np.ndarray:
+    if cols <= 1:
+        u = np.zeros(1, dtype=np.float32)
+    else:
+        u = np.linspace(0.0, 1.0, cols, dtype=np.float32)
+    if rows <= 1:
+        v = np.zeros(1, dtype=np.float32)
+    else:
+        v = np.linspace(0.0, 1.0, rows, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v, indexing="xy")
+    return _sample_texture(texture, uu, vv, repeat=repeat, flip_v=flip_v)
+
+
+def _update_texture_mesh(mesh, pos: np.ndarray):
+    coords = np.stack([pos[..., 0], pos[..., 1]], axis=2)
+    if hasattr(mesh, "set_coordinates"):
+        mesh.set_coordinates(coords)
+    else:
+        mesh._coordinates = coords  # fallback for older Matplotlib
+        mesh.stale = True
+
+
 def apply_mouse_force(
     SO: SoftObject, inter: Optional[MouseInteractor], drag_k: float, pin_drag: bool = False
 ) -> Optional[Tuple[int, int]]:
@@ -180,6 +280,7 @@ def run_sim(args):
     selected_scatter = None
     fracture_line = None
     inter = None
+    texture_mesh = None
 
     if args.show:
         if plt is None:
@@ -190,6 +291,26 @@ def run_sim(args):
         ax.set_xlim(-0.1, max(row, col) * edge_len + 0.1)
         ax.set_ylim(-0.1, max(row, col) * edge_len + 0.1)
         ax.set_title("Soft Object Simulation (NumPy)")
+        if args.texture:
+            tex_img = _load_texture_image(args.texture)
+            tex_colors = _build_texture_colors(
+                SO.rows,
+                SO.cols,
+                tex_img,
+                repeat=args.texture_repeat,
+            )
+            alpha = float(np.clip(args.texture_alpha, 0.0, 1.0))
+            if alpha < 1.0:
+                tex_colors[..., 3] *= alpha
+            texture_mesh = ax.pcolormesh(
+                SO.pos[..., 0],
+                SO.pos[..., 1],
+                tex_colors,
+                shading="gouraud",
+                edgecolors="none",
+            )
+            texture_mesh.set_zorder(0)
+
         fixed_pts = np.argwhere(SO.fixed_mode)
         fixed_xy = SO.pos[fixed_pts[:, 0], fixed_pts[:, 1], :]
         fixed_scatter = ax.scatter(fixed_xy[:, 0], fixed_xy[:, 1], c="k", s=20, label="Fixed")
@@ -202,6 +323,10 @@ def run_sim(args):
         else:
             (fracture_line,) = ax.plot(frac_canvas[:, 0], frac_canvas[:, 1], "w-", linewidth=3)
         selected_scatter = ax.scatter([], [], c="b", s=40, label="Selected")
+        line_canvas.set_zorder(2)
+        fracture_line.set_zorder(3)
+        fixed_scatter.set_zorder(4)
+        selected_scatter.set_zorder(5)
         inter = MouseInteractor(ax, SO)
 
     t0 = time.time()
@@ -226,6 +351,8 @@ def run_sim(args):
 
         should_draw = args.show and (t % args.draw_interval == 0 or (inter and inter.mouse_down))
         if should_draw and ax is not None:
+            if texture_mesh is not None:
+                _update_texture_mesh(texture_mesh, SO.pos)
             canvas = _get_canvas(SO, args.draw_mode, args.draw_skip)
             line_canvas.set_data(canvas[:, 0], canvas[:, 1])
 
@@ -280,14 +407,14 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=100)
-    parser.add_argument("--cols", type=int, default=100)
+    parser.add_argument("--rows", type=int, default=50)
+    parser.add_argument("--cols", type=int, default=50)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)
     parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument("--ts", type=float, default=0.005)
-    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--draw-interval", type=int, default=15)
     parser.add_argument(
         "--draw-mode",
@@ -298,6 +425,15 @@ def main():
     parser.add_argument("--draw-skip", type=int, default=1, help="绘制下采样（>1 时跳点/边）")
     parser.add_argument("--drag-k", type=float, default=5.0, help="鼠标拖拽虚拟弹簧系数")
     parser.add_argument("--pin-drag", action="store_true", help="拖拽时将节点直接钉在鼠标位置")
+    parser.add_argument(
+        "--texture",
+        nargs="?",
+        const="checker",
+        default=None,
+        help="纹理图片路径；仅给出 --texture 时使用内置棋盘格纹理",
+    )
+    parser.add_argument("--texture-alpha", type=float, default=1.0, help="纹理透明度 (0~1)")
+    parser.add_argument("--texture-repeat", type=int, default=1, help="纹理平铺次数")
     parser.add_argument("--show", action="store_true", help="开启 Matplotlib 动画（默认仅计算不绘图）")
     args = parser.parse_args()
     run_sim(args)

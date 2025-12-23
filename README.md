@@ -23,6 +23,7 @@
 - 🔧 **可配置参数**：丰富的物理参数和渲染选项
 - 📊 **多种渲染模式**：完整网格、仅边界、仅节点
 - 🔨 **裂缝模拟**：支持预设裂缝，可视化断裂效果
+- 🖼️ **纹理贴图**：支持在 2D 网格上贴图并随形变更新
 - ⚡ **高性能计算**：优化的 NumPy 向量化操作
 
 ## 📦 安装
@@ -78,6 +79,12 @@ python3 main.py --show --draw-mode contour --steps 2000
 
 # 仅显示节点
 python3 main.py --show --draw-mode points --steps 2000
+
+# 贴图纹理（默认棋盘格）
+python3 main.py --show --texture --steps 2000
+
+# 贴图纹理（自定义图片）
+python3 main.py --show --texture ./texture.png --steps 2000
 ```
 
 ## ⚙️ 参数说明
@@ -113,6 +120,9 @@ python3 main.py --show --draw-mode points --steps 2000
 | `--draw-mode` | 渲染模式 | `full` | `full`, `contour`, `points` |
 | `--draw-interval` | 绘图更新间隔 | 15 | 正整数 |
 | `--draw-skip` | 绘图下采样（>1 减少渲染开销） | 1 | 正整数 |
+| `--texture` | 纹理图片路径（不带参数时用棋盘格） | 无 | 路径或省略参数 |
+| `--texture-alpha` | 纹理透明度 | 1.0 | 0~1 |
+| `--texture-repeat` | 纹理平铺次数 | 1 | 正整数 |
 
 ### 交互参数
 
