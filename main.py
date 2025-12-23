@@ -156,9 +156,16 @@ def _normalize_texture_image(img: np.ndarray) -> np.ndarray:
 def _load_texture_image(texture_path: str) -> np.ndarray:
     if texture_path == "checker":
         return _make_checker_texture()
-    from matplotlib import image as mpimg
+    try:
+        from matplotlib import image as mpimg
 
-    img = mpimg.imread(texture_path)
+        img = mpimg.imread(texture_path)
+    except Exception:
+        try:
+            from PIL import Image
+        except Exception as exc:
+            raise ImportError("Texture loading requires matplotlib or Pillow.") from exc
+        img = np.asarray(Image.open(texture_path))
     return _normalize_texture_image(img)
 
 
@@ -322,7 +329,102 @@ def apply_mouse_force(
     return (r, c)
 
 
+def run_sim_cuda(args):
+    try:
+        from cuda_gl_renderer import CUDAGLInteractor, CUDAGLRenderer
+    except Exception as exc:
+        raise ImportError("CUDA-OpenGL renderer requires pycuda, PyOpenGL, glfw.") from exc
+
+    row = args.rows
+    col = args.cols
+    edge_len = args.edge_len
+    stiffness = args.k
+    damping = args.damping
+    mass = args.mass
+    ts = args.ts
+
+    active_mask = None
+    if args.select_shape:
+        active_mask = _select_shape_mask(row, col, edge_len)
+        if active_mask is not None and not np.any(active_mask):
+            raise ValueError("选择区域为空，无法开始仿真。")
+
+    if row >= 50:
+        num_fixed = 15
+    elif row >= 20:
+        num_fixed = 10
+    else:
+        num_fixed = 5
+    pt_fixed_idx = _compute_fixed_points(row, col, num_fixed, active_mask)
+
+    SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx, active_mask=active_mask)
+    build_fracture(SO, row, col)
+
+    use_texture = args.texture is not None or args.draw_mode == "texture"
+    texture_img = None
+    if use_texture:
+        tex_path = args.texture if args.texture is not None else "checker"
+        texture_img = _load_texture_image(tex_path)
+        alpha = float(np.clip(args.texture_alpha, 0.0, 1.0))
+        if alpha < 1.0:
+            texture_img = texture_img.copy()
+            texture_img[..., 3] *= alpha
+
+    draw_mode = args.draw_mode
+    if use_texture:
+        draw_mode = "texture"
+    elif draw_mode == "full":
+        draw_mode = "points"
+
+    renderer = CUDAGLRenderer(
+        row,
+        col,
+        edge_len,
+        draw_mode=draw_mode,
+        draw_skip=args.draw_skip,
+        texture_image=texture_img,
+        texture_repeat=args.texture_repeat,
+        active_mask=active_mask,
+    )
+    inter = CUDAGLInteractor(renderer, SO, renderer.bounds)
+
+    t0 = time.time()
+    last_force_idx: Optional[Tuple[int, int]] = None
+    steps_done = 0
+
+    try:
+        for t in range(args.steps):
+            inter.process_events()
+            if inter.selected_idx is not None and last_force_idx and inter.selected_idx != last_force_idx:
+                r_prev, c_prev = last_force_idx
+                if 0 <= r_prev < SO.rows and 0 <= c_prev < SO.cols:
+                    SO.clear_force_ext(r_prev, c_prev)
+                last_force_idx = None
+            last_force_idx = apply_mouse_force(SO, inter, args.drag_k, pin_drag=args.pin_drag)
+
+            SO.update_soft_object(mass, ts)
+
+            if inter.quit:
+                print("收到按键 'q'，提前结束。")
+                steps_done = t + 1
+                break
+
+            should_draw = t % args.draw_interval == 0 or inter.mouse_down
+            if should_draw:
+                renderer.update(SO, inter.selected_idx)
+
+            steps_done = t + 1
+    finally:
+        renderer.close()
+
+    dt = time.time() - t0
+    print(f"Simulated {steps_done} steps in {dt:.3f}s (avg {steps_done/dt:.1f} steps/s)")
+
+
 def run_sim(args):
+    if args.renderer == "cuda":
+        run_sim_cuda(args)
+        return
     row = args.rows
     col = args.cols
     edge_len = args.edge_len
@@ -332,7 +434,7 @@ def run_sim(args):
     ts = args.ts
     grid_alpha = args.grid_alpha
     if grid_alpha is None:
-        grid_alpha = 0.0 if args.texture and args.draw_mode == "full" else 1.0
+        grid_alpha = 0.0 if args.texture and args.draw_mode in ("full", "texture") else 1.0
     grid_alpha = float(np.clip(grid_alpha, 0.0, 1.0))
 
     active_mask = None
@@ -482,7 +584,7 @@ def run_sim(args):
 
 
 def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
-    if mode == "full":
+    if mode in ("full", "texture"):
         canvas = SO.drawSoftObject()
     elif mode == "contour":
         canvas = SO.drawSoftObjectContour()
@@ -495,8 +597,8 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=30)
-    parser.add_argument("--cols", type=int, default=30)
+    parser.add_argument("--rows", type=int, default=50)
+    parser.add_argument("--cols", type=int, default=50)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)
@@ -506,9 +608,9 @@ def main():
     parser.add_argument("--draw-interval", type=int, default=15)
     parser.add_argument(
         "--draw-mode",
-        choices=["full", "contour", "points"],
+        choices=["full", "contour", "points", "texture"],
         default="full",
-        help="full=全部连边，contour=只画边界，points=只画节点",
+        help="full=全部连边，contour=只画边界，points=只画节点，texture=纹理网格（CUDA 渲染）",
     )
     parser.add_argument("--draw-skip", type=int, default=1, help="绘制下采样（>1 时跳点/边）")
     parser.add_argument("--drag-k", type=float, default=5.0, help="鼠标拖拽虚拟弹簧系数")
@@ -527,6 +629,12 @@ def main():
         type=float,
         default=None,
         help="网格线透明度 (0~1)，默认在 full 模式且启用纹理时为 0",
+    )
+    parser.add_argument(
+        "--renderer",
+        choices=["mpl", "cuda"],
+        default="mpl",
+        help="渲染后端：mpl=Matplotlib，cuda=CUDA-OpenGL",
     )
     parser.add_argument(
         "--select-shape",

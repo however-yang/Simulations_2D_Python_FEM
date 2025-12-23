@@ -25,6 +25,7 @@
 - 🔨 **裂缝模拟**：支持预设裂缝，可视化断裂效果
 - 🖼️ **纹理贴图**：支持在 2D 网格上贴图并随形变更新
 - ✂️ **形状选择**：运行前用鼠标圈选非矩形形状
+- ⚡ **CUDA-OpenGL 渲染**：可选 GPU 渲染纹理网格以提升帧率
 - ⚡ **高性能计算**：优化的 NumPy 向量化操作
 
 ## 📦 安装
@@ -44,6 +45,30 @@ pip install vispy
 # CUDA-OpenGL 渲染器（需要 CUDA 支持）
 pip install pycuda PyOpenGL glfw
 ```
+
+使用 CUDA-OpenGL 渲染时，命令示例：
+```bash
+python3 main.py --renderer cuda --draw-mode texture --texture ./texture.png
+```
+
+CUDA-OpenGL 互操作需要 PyCUDA 启用 GL 支持，验证方式：
+```bash
+python3 - <<'PY'
+import pycuda._driver as drv
+print(drv.have_gl_ext())
+PY
+```
+若输出为 `False`，请从源码重新安装并确保 `CUDA_ENABLE_GL = True`：
+```bash
+python3 -m pip download --no-binary :all: pycuda==2025.1.2 -d /tmp/pycuda-src
+tar -xf /tmp/pycuda-src/pycuda-2025.1.2.tar.gz -C /tmp/pycuda-src
+cd /tmp/pycuda-src/pycuda-2025.1.2
+python3 configure.py --update-user
+# 确认 ~/.aksetup-defaults.py 里 CUDA_ENABLE_GL = True
+pip uninstall -y pycuda
+pip install --no-cache-dir --no-binary :all: --no-build-isolation .
+```
+提示：验证命令请在非源码目录下执行，避免导入未编译的模块。
 
 ## 🚀 快速开始
 
@@ -92,6 +117,8 @@ python3 main.py --show --texture ./texture.png --grid-alpha 0 --steps 2000
 
 # 运行前圈选形状（按 Enter 确认）
 python3 main.py --show --select-shape --steps 2000
+# CUDA-OpenGL 纹理渲染（GPU）
+python3 main.py --renderer cuda --draw-mode texture --texture ./texture.png --steps 2000
 ```
 
 ## ⚙️ 参数说明
@@ -100,8 +127,8 @@ python3 main.py --show --select-shape --steps 2000
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--rows` | 网格行数 | 100 |
-| `--cols` | 网格列数 | 100 |
+| `--rows` | 网格行数 | 50 |
+| `--cols` | 网格列数 | 50 |
 | `--edge-len` | 节点间距 | 0.02 |
 
 ### 物理参数
@@ -117,14 +144,14 @@ python3 main.py --show --select-shape --steps 2000
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--steps` | 迭代步数 | 2000 |
+| `--steps` | 迭代步数 | 20000 |
 | `--show` | 开启可视化（不加则仅计算） | False |
 
 ### 渲染参数
 
 | 参数 | 说明 | 默认值 | 可选值 |
 |------|------|--------|--------|
-| `--draw-mode` | 渲染模式 | `full` | `full`, `contour`, `points` |
+| `--draw-mode` | 渲染模式 | `full` | `full`, `contour`, `points`, `texture` |
 | `--draw-interval` | 绘图更新间隔 | 15 | 正整数 |
 | `--draw-skip` | 绘图下采样（>1 减少渲染开销） | 1 | 正整数 |
 | `--texture` | 纹理图片路径（不带参数时用棋盘格） | 无 | 路径或省略参数 |
@@ -132,6 +159,7 @@ python3 main.py --show --select-shape --steps 2000
 | `--texture-repeat` | 纹理平铺次数 | 1 | 正整数 |
 | `--grid-alpha` | 网格线透明度 | 自动 | 0~1 |
 | `--select-shape` | 运行前鼠标圈选形状 | False | True/False |
+| `--renderer` | 渲染后端 | `mpl` | `mpl`, `cuda` |
 
 ### 交互参数
 
@@ -163,6 +191,12 @@ python3 main.py --show --select-shape --steps 2000
 - 绘图时以白线标出断裂位置
 - 裂缝位置根据网格大小自适应调整
 
+### CUDA-OpenGL 渲染说明
+
+- `--renderer cuda` 支持 `points` / `contour` / `texture` 渲染
+- 纹理网格使用 GPU 端纹理采样并随形变更新
+- 当前不绘制固定点与裂缝线
+
 ### 形状选择说明
 
 - 运行时会弹出选择窗口，按住鼠标拖拽圈选区域
@@ -179,7 +213,7 @@ p_new = 2 * p - p_old + dt² * a
 ## 📁 项目结构
 
 ```
-Simulations_Python/
+Simulations_2D_Python/
 ├── main.py              # 主程序入口
 ├── soft_object.py       # 软体对象核心类（NumPy 实现）
 ├── gpu_renderer.py      # 可选：Vispy GPU 渲染器
