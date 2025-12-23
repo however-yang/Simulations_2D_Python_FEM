@@ -134,18 +134,19 @@ def _make_checker_texture(size: int = 256, tiles: int = 8) -> np.ndarray:
 def _normalize_texture_image(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
         img = np.stack([img, img, img], axis=2)
+    if np.issubdtype(img.dtype, np.integer):
+        max_val = float(np.iinfo(img.dtype).max)
+        img = img.astype(np.float32) / max_val
+    else:
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img /= 255.0
+
     if img.shape[2] == 3:
         alpha = np.ones((*img.shape[:2], 1), dtype=img.dtype)
         img = np.concatenate([img, alpha], axis=2)
     elif img.shape[2] != 4:
         raise ValueError("Texture image must have 1, 3 or 4 channels.")
-
-    if np.issubdtype(img.dtype, np.integer):
-        img = img.astype(np.float32) / 255.0
-    else:
-        img = img.astype(np.float32)
-        if img.max() > 1.0:
-            img /= 255.0
     return np.clip(img, 0.0, 1.0)
 
 
@@ -261,6 +262,10 @@ def run_sim(args):
     damping = args.damping
     mass = args.mass
     ts = args.ts
+    grid_alpha = args.grid_alpha
+    if grid_alpha is None:
+        grid_alpha = 0.0 if args.texture and args.draw_mode == "full" else 1.0
+    grid_alpha = float(np.clip(grid_alpha, 0.0, 1.0))
 
     # 固定点：左边缘若干节点（与 MATLAB 一致）
     if row >= 50:
@@ -308,8 +313,10 @@ def run_sim(args):
                 tex_colors,
                 shading="gouraud",
                 edgecolors="none",
+                linewidth=0.0,
+                antialiased=False,
             )
-            texture_mesh.set_zorder(0)
+            texture_mesh.set_zorder(1)
 
         fixed_pts = np.argwhere(SO.fixed_mode)
         fixed_xy = SO.pos[fixed_pts[:, 0], fixed_pts[:, 1], :]
@@ -317,6 +324,10 @@ def run_sim(args):
 
         canvas = _get_canvas(SO, args.draw_mode, args.draw_skip)
         (line_canvas,) = ax.plot(canvas[:, 0], canvas[:, 1], "r-", linewidth=1)
+        if grid_alpha <= 0.0:
+            line_canvas.set_visible(False)
+        elif grid_alpha < 1.0:
+            line_canvas.set_alpha(grid_alpha)
         frac_canvas = build_fracture_canvas(SO, fracture_info)
         if frac_canvas is None:
             (fracture_line,) = ax.plot([], [], "w-", linewidth=3)
@@ -407,8 +418,8 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=50)
-    parser.add_argument("--cols", type=int, default=50)
+    parser.add_argument("--rows", type=int, default=30)
+    parser.add_argument("--cols", type=int, default=30)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)
@@ -434,6 +445,12 @@ def main():
     )
     parser.add_argument("--texture-alpha", type=float, default=1.0, help="纹理透明度 (0~1)")
     parser.add_argument("--texture-repeat", type=int, default=1, help="纹理平铺次数")
+    parser.add_argument(
+        "--grid-alpha",
+        type=float,
+        default=None,
+        help="网格线透明度 (0~1)，默认在 full 模式且启用纹理时为 0",
+    )
     parser.add_argument("--show", action="store_true", help="开启 Matplotlib 动画（默认仅计算不绘图）")
     args = parser.parse_args()
     run_sim(args)

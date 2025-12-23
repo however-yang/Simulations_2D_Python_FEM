@@ -85,6 +85,9 @@ python3 main.py --show --texture --steps 2000
 
 # 贴图纹理（自定义图片）
 python3 main.py --show --texture ./texture.png --steps 2000
+
+# 贴图纹理且隐藏网格线（可选设置）
+python3 main.py --show --texture ./texture.png --grid-alpha 0 --steps 2000
 ```
 
 ## ⚙️ 参数说明
@@ -123,6 +126,7 @@ python3 main.py --show --texture ./texture.png --steps 2000
 | `--texture` | 纹理图片路径（不带参数时用棋盘格） | 无 | 路径或省略参数 |
 | `--texture-alpha` | 纹理透明度 | 1.0 | 0~1 |
 | `--texture-repeat` | 纹理平铺次数 | 1 | 正整数 |
+| `--grid-alpha` | 网格线透明度 | 自动 | 0~1 |
 
 ### 交互参数
 
