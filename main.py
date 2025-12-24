@@ -19,21 +19,29 @@ class MouseInteractor:
         self.ax = ax
         self.so = soft_obj
         self.mouse_down = False
+        self.space_down = False
         self.mouse_pos: Optional[Tuple[float, float]] = None
         self.selected_idx: Optional[Tuple[int, int]] = None
         self.quit = False
+        self.cut_pending = False
         canvas = ax.figure.canvas
         self._cids = [
             canvas.mpl_connect("button_press_event", self._on_press),
             canvas.mpl_connect("button_release_event", self._on_release),
             canvas.mpl_connect("motion_notify_event", self._on_motion),
             canvas.mpl_connect("key_press_event", self._on_key),
+            canvas.mpl_connect("key_release_event", self._on_key_release),
         ]
 
     def _on_press(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
-        if getattr(event, "button", None) not in (None, 1):
+        button = getattr(event, "button", None)
+        if button == 3 and self.space_down:
+            if self.so.cut_nearest_edge(event.xdata, event.ydata):
+                self.cut_pending = True
+            return
+        if button not in (None, 1):
             return
         self.mouse_down = True
         self.mouse_pos = (event.xdata, event.ydata)
@@ -52,6 +60,12 @@ class MouseInteractor:
     def _on_key(self, event):
         if event.key == "q":
             self.quit = True
+        elif event.key in (" ", "space"):
+            self.space_down = True
+
+    def _on_key_release(self, event):
+        if event.key in (" ", "space"):
+            self.space_down = False
 
     def disconnect(self):
         canvas = self.ax.figure.canvas
@@ -409,9 +423,10 @@ def run_sim_cuda(args):
                 steps_done = t + 1
                 break
 
-            should_draw = t % args.draw_interval == 0 or inter.mouse_down
+            should_draw = t % args.draw_interval == 0 or inter.mouse_down or inter.cut_pending
             if should_draw:
                 renderer.update(SO, inter.selected_idx)
+                inter.cut_pending = False
 
             steps_done = t + 1
     finally:
@@ -539,12 +554,16 @@ def run_sim(args):
             steps_done = t + 1
             break
 
-        should_draw = args.show and (t % args.draw_interval == 0 or (inter and inter.mouse_down))
+        should_draw = args.show and (
+            t % args.draw_interval == 0 or (inter and (inter.mouse_down or inter.cut_pending))
+        )
         if should_draw and ax is not None:
             if texture_mesh is not None:
                 _update_texture_mesh(texture_mesh, SO.pos)
             canvas = _get_canvas(SO, args.draw_mode, args.draw_skip)
             line_canvas.set_data(canvas[:, 0], canvas[:, 1])
+            if inter:
+                inter.cut_pending = False
 
             if fracture_line is not None:
                 frac_canvas = build_fracture_canvas(SO, fracture_info)
@@ -597,8 +616,8 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=100)
-    parser.add_argument("--cols", type=int, default=100)
+    parser.add_argument("--rows", type=int, default=10)
+    parser.add_argument("--cols", type=int, default=10)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)

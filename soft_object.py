@@ -97,6 +97,12 @@ class SoftObject:
             for m in modes:
                 mask |= self.conn_mode == m
             self.offset_masks[off] = mask
+        if not hasattr(self, "cut_masks") or not self.cut_masks:
+            self.cut_masks = {off: np.zeros((self.rows, self.cols), dtype=bool) for off in self.offset_map}
+        else:
+            for off in self.offset_map:
+                if off not in self.cut_masks or self.cut_masks[off].shape != (self.rows, self.cols):
+                    self.cut_masks[off] = np.zeros((self.rows, self.cols), dtype=bool)
         self._build_draw_edges()
 
     def set_active_mask(self, mask: np.ndarray, rebuild: bool = True):
@@ -123,6 +129,8 @@ class SoftObject:
             if hasattr(self, "active"):
                 neigh_active, _ = self._shift_with_mask(self.active, dr, dc)
                 valid &= self.active & neigh_active
+            if hasattr(self, "cut_masks"):
+                valid &= ~self.cut_masks[(dr, dc)]
             r_idx, c_idx = np.nonzero(valid)
             for r, c in zip(r_idx.tolist(), c_idx.tolist()):
                 start_idx.append(flat(r, c))
@@ -174,6 +182,8 @@ class SoftObject:
             if hasattr(self, "active"):
                 neigh_active, _ = self._shift_with_mask(self.active, dr, dc)
                 valid &= self.active & neigh_active
+            if hasattr(self, "cut_masks"):
+                valid &= ~self.cut_masks[(dr, dc)]
             if not np.any(valid):
                 continue
 
@@ -192,6 +202,74 @@ class SoftObject:
             force_sum += force_dir
 
         return force_sum
+
+    def cut_connection(self, r0: int, c0: int, r1: int, c1: int) -> bool:
+        dr = r1 - r0
+        dc = c1 - c0
+        if (dr, dc) not in self.offset_map:
+            return False
+        if not (0 <= r0 < self.rows and 0 <= c0 < self.cols):
+            return False
+        if not (0 <= r1 < self.rows and 0 <= c1 < self.cols):
+            return False
+        if not self.offset_masks[(dr, dc)][r0, c0]:
+            return False
+        if hasattr(self, "active"):
+            if not (self.active[r0, c0] and self.active[r1, c1]):
+                return False
+        if self.cut_masks[(dr, dc)][r0, c0]:
+            return False
+        self.cut_masks[(dr, dc)][r0, c0] = True
+        self.cut_masks[(-dr, -dc)][r1, c1] = True
+        self._build_draw_edges()
+        return True
+
+    def cut_nearest_edge(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
+        r, c = self.find_closest_node(x, y)
+        if r < 0 or c < 0:
+            return False
+        if hasattr(self, "active") and not self.active[r, c]:
+            return False
+
+        p = np.array([x, y], dtype=np.float64)
+        best = None
+        best_dist = np.inf
+        best_len = None
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            r2 = r + dr
+            c2 = c + dc
+            if not (0 <= r2 < self.rows and 0 <= c2 < self.cols):
+                continue
+            if not self.offset_masks[(dr, dc)][r, c]:
+                continue
+            if self.cut_masks[(dr, dc)][r, c]:
+                continue
+            if hasattr(self, "active"):
+                if not (self.active[r, c] and self.active[r2, c2]):
+                    continue
+            a = self.pos[r, c]
+            b = self.pos[r2, c2]
+            ab = b - a
+            ab_len2 = float(np.dot(ab, ab))
+            if ab_len2 < 1e-12:
+                continue
+            t = float(np.dot(p - a, ab) / ab_len2)
+            t = max(0.0, min(1.0, t))
+            proj = a + t * ab
+            dist = float(np.linalg.norm(p - proj))
+            if dist < best_dist:
+                best_dist = dist
+                best = (r2, c2)
+                best_len = float(np.sqrt(ab_len2))
+
+        if best is None:
+            return False
+        limit = max_dist
+        if limit is None:
+            limit = 0.6 * (best_len if best_len is not None else self.edge_len)
+        if best_dist > limit:
+            return False
+        return self.cut_connection(r, c, best[0], best[1])
 
     def _shift_with_mask(self, tensor: np.ndarray, dr: int, dc: int) -> Tuple[np.ndarray, np.ndarray]:
         rows, cols = tensor.shape[:2]

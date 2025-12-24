@@ -17,9 +17,11 @@ class CUDAGLInteractor:
         self.renderer = renderer
         self.so = so
         self.mouse_down = False
+        self.space_down = False
         self.mouse_pos: Optional[Tuple[float, float]] = None
         self.selected_idx: Optional[Tuple[int, int]] = None
         self.quit = False
+        self.cut_pending = False
         self.bounds = bounds  # (xmin, xmax, ymin, ymax)
         glfw.set_mouse_button_callback(renderer.window, self._on_mouse_button)
         glfw.set_cursor_pos_callback(renderer.window, self._on_cursor)
@@ -35,10 +37,14 @@ class CUDAGLInteractor:
         return wx, wy
 
     def _on_mouse_button(self, window, button, action, mods):
-        if button != glfw.MOUSE_BUTTON_LEFT:
-            return
         x, y = glfw.get_cursor_pos(window)
         wx, wy = self._screen_to_world(x, y)
+        if button == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS and self.space_down:
+            if self.so.cut_nearest_edge(wx, wy):
+                self.cut_pending = True
+            return
+        if button != glfw.MOUSE_BUTTON_LEFT:
+            return
         if action == glfw.PRESS:
             self.mouse_down = True
             self.mouse_pos = (wx, wy)
@@ -53,6 +59,12 @@ class CUDAGLInteractor:
         self.mouse_pos = (wx, wy)
 
     def _on_key(self, window, key, scancode, action, mods):
+        if key == glfw.KEY_SPACE:
+            if action == glfw.PRESS:
+                self.space_down = True
+            elif action == glfw.RELEASE:
+                self.space_down = False
+            return
         if action == glfw.PRESS and (key == glfw.KEY_Q or key == glfw.KEY_ESCAPE):
             self.quit = True
 
