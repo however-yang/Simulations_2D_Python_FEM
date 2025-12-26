@@ -103,7 +103,13 @@ class SoftObject:
             for off in self.offset_map:
                 if off not in self.cut_masks or self.cut_masks[off].shape != (self.rows, self.cols):
                     self.cut_masks[off] = np.zeros((self.rows, self.cols), dtype=bool)
-        self._build_draw_edges()
+        cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
+        if not hasattr(self, "removed_cells") or self.removed_cells.shape != cell_shape:
+            self.removed_cells = np.zeros(cell_shape, dtype=bool)
+            self.removed_cells_version = 0
+        elif not hasattr(self, "removed_cells_version"):
+            self.removed_cells_version = 0
+        self._rebuild_cut_masks_from_removed_cells()
 
     def set_active_mask(self, mask: np.ndarray, rebuild: bool = True):
         mask = np.asarray(mask, dtype=bool)
@@ -140,6 +146,47 @@ class SoftObject:
             self._draw_edges = (np.array(start_idx, dtype=int), np.array(end_idx, dtype=int))
         else:
             self._draw_edges = None
+
+    def _rebuild_cut_masks_from_removed_cells(self):
+        if not hasattr(self, "cut_masks") or not hasattr(self, "removed_cells"):
+            return
+        for off in self.cut_masks:
+            self.cut_masks[off].fill(False)
+        if self.rows < 2 or self.cols < 2:
+            self._build_draw_edges()
+            return
+
+        removed = self.removed_cells
+        # 水平边：上下两侧单元都被移除才切断
+        above = np.zeros((self.rows, self.cols - 1), dtype=bool)
+        below = np.zeros((self.rows, self.cols - 1), dtype=bool)
+        above[1:, :] = removed
+        below[:-1, :] = removed
+        cut_h = above & below
+        # 边界水平边：只有一侧有单元，单元被移除即切断
+        cut_h[0, :] |= removed[0, :]
+        cut_h[-1, :] |= removed[-1, :]
+        self.cut_masks[(0, 1)][:, :-1] = cut_h
+        self.cut_masks[(0, -1)][:, 1:] = cut_h
+
+        # 垂直边：左右两侧单元都被移除才切断
+        left = np.zeros((self.rows - 1, self.cols), dtype=bool)
+        right = np.zeros((self.rows - 1, self.cols), dtype=bool)
+        left[:, 1:] = removed
+        right[:, :-1] = removed
+        cut_v = left & right
+        # 边界垂直边：只有一侧有单元，单元被移除即切断
+        cut_v[:, 0] |= removed[:, 0]
+        cut_v[:, -1] |= removed[:, -1]
+        self.cut_masks[(1, 0)][:-1, :] = cut_v
+        self.cut_masks[(-1, 0)][1:, :] = cut_v
+
+        # 对角弹簧：所在单元被移除就切断
+        self.cut_masks[(1, 1)][:-1, :-1] = removed
+        self.cut_masks[(-1, -1)][1:, 1:] = removed
+        self.cut_masks[(1, -1)][:-1, 1:] = removed
+        self.cut_masks[(-1, 1)][1:, :-1] = removed
+        self._build_draw_edges()
 
     # ------------------------------------------------------------------ 更新
     def update_soft_object(self, mass: float, ts: float):
@@ -203,73 +250,60 @@ class SoftObject:
 
         return force_sum
 
-    def cut_connection(self, r0: int, c0: int, r1: int, c1: int) -> bool:
-        dr = r1 - r0
-        dc = c1 - c0
-        if (dr, dc) not in self.offset_map:
+    def remove_nearest_cell(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
+        if self.rows < 2 or self.cols < 2:
             return False
-        if not (0 <= r0 < self.rows and 0 <= c0 < self.cols):
-            return False
-        if not (0 <= r1 < self.rows and 0 <= c1 < self.cols):
-            return False
-        if not self.offset_masks[(dr, dc)][r0, c0]:
-            return False
+        cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
+        if not hasattr(self, "removed_cells") or self.removed_cells.shape != cell_shape:
+            self.removed_cells = np.zeros(cell_shape, dtype=bool)
+            self._rebuild_cut_masks_from_removed_cells()
+
+        centers = (
+            self.pos[:-1, :-1]
+            + self.pos[1:, :-1]
+            + self.pos[:-1, 1:]
+            + self.pos[1:, 1:]
+        ) * 0.25
+        valid = np.ones(cell_shape, dtype=bool)
         if hasattr(self, "active"):
-            if not (self.active[r0, c0] and self.active[r1, c1]):
-                return False
-        if self.cut_masks[(dr, dc)][r0, c0]:
+            active = self.active
+            valid &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
+        valid &= ~self.removed_cells
+        if not np.any(valid):
             return False
-        self.cut_masks[(dr, dc)][r0, c0] = True
-        self.cut_masks[(-dr, -dc)][r1, c1] = True
-        self._build_draw_edges()
+
+        target = np.array([x, y], dtype=np.float64)
+        diff = centers - target
+        dist2 = (diff * diff).sum(axis=2)
+        dist2 = np.where(valid, dist2, np.inf)
+        flat_idx = int(np.argmin(dist2))
+        best_dist2 = float(dist2.ravel()[flat_idx])
+        if not np.isfinite(best_dist2):
+            return False
+        if max_dist is not None and best_dist2 > max_dist * max_dist:
+            return False
+
+        r = int(flat_idx // (self.cols - 1))
+        c = int(flat_idx % (self.cols - 1))
+        self.removed_cells[r, c] = True
+        self.removed_cells_version = int(getattr(self, "removed_cells_version", 0)) + 1
+        self._rebuild_cut_masks_from_removed_cells()
         return True
 
-    def cut_nearest_edge(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
-        r, c = self.find_closest_node(x, y)
-        if r < 0 or c < 0:
-            return False
-        if hasattr(self, "active") and not self.active[r, c]:
-            return False
-
-        p = np.array([x, y], dtype=np.float64)
-        best = None
-        best_dist = np.inf
-        best_len = None
-        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            r2 = r + dr
-            c2 = c + dc
-            if not (0 <= r2 < self.rows and 0 <= c2 < self.cols):
-                continue
-            if not self.offset_masks[(dr, dc)][r, c]:
-                continue
-            if self.cut_masks[(dr, dc)][r, c]:
-                continue
-            if hasattr(self, "active"):
-                if not (self.active[r, c] and self.active[r2, c2]):
-                    continue
-            a = self.pos[r, c]
-            b = self.pos[r2, c2]
-            ab = b - a
-            ab_len2 = float(np.dot(ab, ab))
-            if ab_len2 < 1e-12:
-                continue
-            t = float(np.dot(p - a, ab) / ab_len2)
-            t = max(0.0, min(1.0, t))
-            proj = a + t * ab
-            dist = float(np.linalg.norm(p - proj))
-            if dist < best_dist:
-                best_dist = dist
-                best = (r2, c2)
-                best_len = float(np.sqrt(ab_len2))
-
-        if best is None:
-            return False
-        limit = max_dist
-        if limit is None:
-            limit = 0.6 * (best_len if best_len is not None else self.edge_len)
-        if best_dist > limit:
-            return False
-        return self.cut_connection(r, c, best[0], best[1])
+    def get_cut_cell_mask(self) -> Optional[np.ndarray]:
+        if self.rows < 2 or self.cols < 2:
+            return None
+        mask = np.ones((self.rows - 1, self.cols - 1), dtype=bool)
+        if hasattr(self, "active"):
+            active = self.active
+            mask &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
+        if hasattr(self, "removed_cells"):
+            if self.removed_cells.shape != mask.shape:
+                self.removed_cells = np.zeros(mask.shape, dtype=bool)
+                self.removed_cells_version = 0
+                self._rebuild_cut_masks_from_removed_cells()
+            mask &= ~self.removed_cells
+        return mask
 
     def _shift_with_mask(self, tensor: np.ndarray, dr: int, dc: int) -> Tuple[np.ndarray, np.ndarray]:
         rows, cols = tensor.shape[:2]

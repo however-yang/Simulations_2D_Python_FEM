@@ -39,8 +39,8 @@ class CUDAGLInteractor:
     def _on_mouse_button(self, window, button, action, mods):
         x, y = glfw.get_cursor_pos(window)
         wx, wy = self._screen_to_world(x, y)
-        if button == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS and self.space_down:
-            if self.so.cut_nearest_edge(wx, wy):
+        if button == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS:
+            if self.so.remove_nearest_cell(wx, wy):
                 self.cut_pending = True
             return
         if button != glfw.MOUSE_BUTTON_LEFT:
@@ -119,6 +119,19 @@ def _build_uvs(rows: int, cols: int, repeat: int = 1, flip_v: bool = True) -> np
     return np.stack([uu, vv], axis=2).reshape(-1, 2).astype(np.float32)
 
 
+def _build_grid_uvs(rows: int, cols: int) -> np.ndarray:
+    if cols <= 1:
+        u = np.zeros(1, dtype=np.float32)
+    else:
+        u = np.linspace(0.0, 1.0, cols, dtype=np.float32)
+    if rows <= 1:
+        v = np.zeros(1, dtype=np.float32)
+    else:
+        v = np.linspace(0.0, 1.0, rows, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v, indexing="xy")
+    return np.stack([uu, vv], axis=2).reshape(-1, 2).astype(np.float32)
+
+
 def _build_triangle_indices(
     rows: int, cols: int, active_mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -143,6 +156,49 @@ def _build_triangle_indices(
         i3 = grid[1:, 1:][quad_mask]
     tris = np.stack([i0, i2, i1, i1, i2, i3], axis=1).ravel()
     return tris.astype(np.uint32)
+
+
+def _compile_shader(source: str, shader_type: int) -> int:
+    shader = GL.glCreateShader(shader_type)
+    GL.glShaderSource(shader, source)
+    GL.glCompileShader(shader)
+    if not GL.glGetShaderiv(shader, GL.GL_COMPILE_STATUS):
+        log = GL.glGetShaderInfoLog(shader).decode("utf-8", errors="ignore")
+        GL.glDeleteShader(shader)
+        raise RuntimeError(f"Shader compile failed: {log}")
+    return shader
+
+
+def _link_program(vertex_src: str, fragment_src: str) -> int:
+    vs = _compile_shader(vertex_src, GL.GL_VERTEX_SHADER)
+    fs = _compile_shader(fragment_src, GL.GL_FRAGMENT_SHADER)
+    program = GL.glCreateProgram()
+    GL.glAttachShader(program, vs)
+    GL.glAttachShader(program, fs)
+    GL.glLinkProgram(program)
+    if not GL.glGetProgramiv(program, GL.GL_LINK_STATUS):
+        log = GL.glGetProgramInfoLog(program).decode("utf-8", errors="ignore")
+        GL.glDeleteProgram(program)
+        raise RuntimeError(f"Shader link failed: {log}")
+    GL.glDeleteShader(vs)
+    GL.glDeleteShader(fs)
+    return program
+
+
+def _make_ortho_matrix(left: float, right: float, bottom: float, top: float) -> np.ndarray:
+    rl = right - left
+    tb = top - bottom
+    if abs(rl) < 1e-12 or abs(tb) < 1e-12:
+        return np.eye(4, dtype=np.float32)
+    return np.array(
+        [
+            [2.0 / rl, 0.0, 0.0, -(right + left) / rl],
+            [0.0, 2.0 / tb, 0.0, -(top + bottom) / tb],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
 
 class CUDAGLRenderer:
@@ -170,8 +226,24 @@ class CUDAGLRenderer:
         self.window = None
         self.vbo = None
         self.uv_vbo = None
+        self.grid_uv_vbo = None
         self.ebo = None
         self.texture_id = None
+        self.mask_texture_id = None
+        self.mask_internal_format = None
+        self.mask_format = None
+        self.mask_size = np.zeros(2, dtype=np.float32)
+        self.mask_version = -1
+        self._last_removed_cells = None
+        self.shader = None
+        self.attrib_pos = None
+        self.attrib_uv = None
+        self.attrib_grid_uv = None
+        self.uniform_mvp = None
+        self.uniform_tex = None
+        self.uniform_mask = None
+        self.uniform_mask_size = None
+        self.mvp = None
         self.index_count = 0
         self.reg_buffer = None
         self.vertex_capacity = 0
@@ -196,6 +268,7 @@ class CUDAGLRenderer:
         GL.glMatrixMode(GL.GL_PROJECTION)
         GL.glLoadIdentity()
         GL.glOrtho(self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3], -1, 1)
+        self.mvp = _make_ortho_matrix(self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3])
         GL.glMatrixMode(GL.GL_MODELVIEW)
         GL.glLoadIdentity()
         GL.glDisable(GL.GL_DEPTH_TEST)
@@ -224,6 +297,118 @@ class CUDAGLRenderer:
         self.reg_buffer = cudagl.RegisteredBuffer(int(self.vbo))
         self.vertex_capacity = vertex_count
 
+    def _pick_mask_format(self):
+        if hasattr(GL, "GL_RED") and hasattr(GL, "GL_R8"):
+            return GL.GL_R8, GL.GL_RED
+        if hasattr(GL, "GL_LUMINANCE"):
+            return GL.GL_LUMINANCE, GL.GL_LUMINANCE
+        return GL.GL_ALPHA, GL.GL_ALPHA
+
+    def _init_mask_texture(self):
+        if self.rows < 2 or self.cols < 2:
+            return
+        self.mask_internal_format, self.mask_format = self._pick_mask_format()
+        self.mask_size = np.array([self.cols - 1, self.rows - 1], dtype=np.float32)
+        mask = np.full((self.rows - 1, self.cols - 1), 255, dtype=np.uint8)
+        self.mask_texture_id = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.mask_texture_id)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexImage2D(
+            GL.GL_TEXTURE_2D,
+            0,
+            self.mask_internal_format,
+            self.cols - 1,
+            self.rows - 1,
+            0,
+            self.mask_format,
+            GL.GL_UNSIGNED_BYTE,
+            mask,
+        )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+    def _init_shader_program(self):
+        vertex_src = """
+        #version 120
+        attribute vec2 a_pos;
+        attribute vec2 a_uv;
+        attribute vec2 a_grid_uv;
+        uniform mat4 u_mvp;
+        varying vec2 v_uv;
+        varying vec2 v_grid_uv;
+        void main() {
+            v_uv = a_uv;
+            v_grid_uv = a_grid_uv;
+            gl_Position = u_mvp * vec4(a_pos.xy, 0.0, 1.0);
+        }
+        """
+        fragment_src = """
+        #version 120
+        uniform sampler2D u_tex;
+        uniform sampler2D u_mask;
+        uniform vec2 u_mask_size;
+        varying vec2 v_uv;
+        varying vec2 v_grid_uv;
+        void main() {
+            vec2 grid = v_grid_uv * u_mask_size;
+            vec2 cell = floor(grid);
+            vec2 max_cell = u_mask_size - vec2(1.0);
+            cell = clamp(cell, vec2(0.0), max_cell);
+            vec2 mask_uv = (cell + vec2(0.5)) / u_mask_size;
+            float mask = texture2D(u_mask, mask_uv).r;
+            if (mask < 0.5) {
+                discard;
+            }
+            gl_FragColor = texture2D(u_tex, v_uv);
+        }
+        """
+        self.shader = _link_program(vertex_src, fragment_src)
+        self.attrib_pos = GL.glGetAttribLocation(self.shader, "a_pos")
+        self.attrib_uv = GL.glGetAttribLocation(self.shader, "a_uv")
+        self.attrib_grid_uv = GL.glGetAttribLocation(self.shader, "a_grid_uv")
+        self.uniform_mvp = GL.glGetUniformLocation(self.shader, "u_mvp")
+        self.uniform_tex = GL.glGetUniformLocation(self.shader, "u_tex")
+        self.uniform_mask = GL.glGetUniformLocation(self.shader, "u_mask")
+        self.uniform_mask_size = GL.glGetUniformLocation(self.shader, "u_mask_size")
+
+    def _update_mask_from_so(self, so):
+        if self.mask_texture_id is None:
+            return
+        removed = getattr(so, "removed_cells", None)
+        if removed is None:
+            return
+        if removed.shape != (self.rows - 1, self.cols - 1):
+            return
+        version = getattr(so, "removed_cells_version", None)
+        if version is not None:
+            if int(version) == self.mask_version:
+                return
+        else:
+            if self._last_removed_cells is not None and np.array_equal(removed, self._last_removed_cells):
+                return
+        mask = np.where(removed, 0, 255).astype(np.uint8, copy=False)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.mask_texture_id)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexSubImage2D(
+            GL.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            self.cols - 1,
+            self.rows - 1,
+            self.mask_format,
+            GL.GL_UNSIGNED_BYTE,
+            mask,
+        )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        if version is not None:
+            self.mask_version = int(version)
+        else:
+            self._last_removed_cells = removed.copy()
+
     def _init_texture_mesh(self):
         if self.rows < 2 or self.cols < 2:
             self.draw_mode = "points"
@@ -231,6 +416,7 @@ class CUDAGLRenderer:
 
         self._resize_vbo(self.rows * self.cols)
         uvs = _build_uvs(self.rows, self.cols, repeat=self.texture_repeat, flip_v=True)
+        grid_uvs = _build_grid_uvs(self.rows, self.cols)
         indices = _build_triangle_indices(self.rows, self.cols, self.active_mask)
         self.index_count = int(indices.size)
         if self.index_count == 0:
@@ -240,6 +426,10 @@ class CUDAGLRenderer:
         self.uv_vbo = GL.glGenBuffers(1)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.uv_vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, uvs.nbytes, uvs, GL.GL_STATIC_DRAW)
+
+        self.grid_uv_vbo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.grid_uv_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, grid_uvs.nbytes, grid_uvs, GL.GL_STATIC_DRAW)
 
         self.ebo = GL.glGenBuffers(1)
         GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
@@ -270,6 +460,8 @@ class CUDAGLRenderer:
         GL.glEnable(GL.GL_TEXTURE_2D)
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        self._init_mask_texture()
+        self._init_shader_program()
 
     def _upload_positions(self, coords, cuda) -> int:
         if hasattr(coords, "data_ptr") and hasattr(coords, "numel"):
@@ -307,24 +499,64 @@ class CUDAGLRenderer:
         if self.draw_mode == "texture":
             coords = so.pos.reshape(-1, 2)
             self._upload_positions(coords, cuda)
+            self._update_mask_from_so(so)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+            if self.shader is None or self.texture_id is None or self.mask_texture_id is None:
+                glfw.swap_buffers(self.window)
+                glfw.poll_events()
+                return
+
+            GL.glUseProgram(self.shader)
+            if self.uniform_mvp is not None and self.mvp is not None:
+                GL.glUniformMatrix4fv(self.uniform_mvp, 1, GL.GL_TRUE, self.mvp)
+            if self.uniform_tex is not None:
+                GL.glUniform1i(self.uniform_tex, 0)
+            if self.uniform_mask is not None:
+                GL.glUniform1i(self.uniform_mask, 1)
+            if self.uniform_mask_size is not None:
+                GL.glUniform2f(
+                    self.uniform_mask_size,
+                    float(self.mask_size[0]),
+                    float(self.mask_size[1]),
+                )
+
+            GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.texture_id)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self.mask_texture_id)
+
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
-            GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
-            GL.glVertexPointer(2, GL.GL_FLOAT, 0, None)
+            if self.attrib_pos is not None and self.attrib_pos >= 0:
+                GL.glEnableVertexAttribArray(self.attrib_pos)
+                GL.glVertexAttribPointer(self.attrib_pos, 2, GL.GL_FLOAT, False, 0, None)
 
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.uv_vbo)
-            GL.glEnableClientState(GL.GL_TEXTURE_COORD_ARRAY)
-            GL.glTexCoordPointer(2, GL.GL_FLOAT, 0, None)
+            if self.attrib_uv is not None and self.attrib_uv >= 0:
+                GL.glEnableVertexAttribArray(self.attrib_uv)
+                GL.glVertexAttribPointer(self.attrib_uv, 2, GL.GL_FLOAT, False, 0, None)
+
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.grid_uv_vbo)
+            if self.attrib_grid_uv is not None and self.attrib_grid_uv >= 0:
+                GL.glEnableVertexAttribArray(self.attrib_grid_uv)
+                GL.glVertexAttribPointer(self.attrib_grid_uv, 2, GL.GL_FLOAT, False, 0, None)
 
             GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
             GL.glDrawElements(GL.GL_TRIANGLES, self.index_count, GL.GL_UNSIGNED_INT, None)
             GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
 
-            GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
-            GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
+            if self.attrib_pos is not None and self.attrib_pos >= 0:
+                GL.glDisableVertexAttribArray(self.attrib_pos)
+            if self.attrib_uv is not None and self.attrib_uv >= 0:
+                GL.glDisableVertexAttribArray(self.attrib_uv)
+            if self.attrib_grid_uv is not None and self.attrib_grid_uv >= 0:
+                GL.glDisableVertexAttribArray(self.attrib_grid_uv)
+
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glUseProgram(0)
             glfw.swap_buffers(self.window)
             glfw.poll_events()
             return
@@ -362,8 +594,28 @@ class CUDAGLRenderer:
         except Exception:
             pass
         try:
+            if self.mask_texture_id is not None:
+                GL.glDeleteTextures([self.mask_texture_id])
+        except Exception:
+            pass
+        try:
+            if self.shader is not None:
+                GL.glDeleteProgram(self.shader)
+        except Exception:
+            pass
+        try:
+            if self.vbo is not None:
+                GL.glDeleteBuffers(1, [int(self.vbo)])
+        except Exception:
+            pass
+        try:
             if self.uv_vbo is not None:
                 GL.glDeleteBuffers(1, [int(self.uv_vbo)])
+        except Exception:
+            pass
+        try:
+            if self.grid_uv_vbo is not None:
+                GL.glDeleteBuffers(1, [int(self.grid_uv_vbo)])
         except Exception:
             pass
         try:

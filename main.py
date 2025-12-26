@@ -37,8 +37,8 @@ class MouseInteractor:
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
         button = getattr(event, "button", None)
-        if button == 3 and self.space_down:
-            if self.so.cut_nearest_edge(event.xdata, event.ydata):
+        if button == 3:
+            if self.so.remove_nearest_cell(event.xdata, event.ydata):
                 self.cut_pending = True
             return
         if button not in (None, 1):
@@ -216,23 +216,44 @@ def _sample_texture(
     return c0 * (1.0 - dy) + c1 * dy
 
 
-def _build_texture_colors(
+def _build_texture_cell_colors(
     rows: int,
     cols: int,
     texture: np.ndarray,
     repeat: int = 1,
     flip_v: bool = True,
 ) -> np.ndarray:
-    if cols <= 1:
-        u = np.zeros(1, dtype=np.float32)
-    else:
-        u = np.linspace(0.0, 1.0, cols, dtype=np.float32)
-    if rows <= 1:
-        v = np.zeros(1, dtype=np.float32)
-    else:
-        v = np.linspace(0.0, 1.0, rows, dtype=np.float32)
+    if rows < 2 or cols < 2:
+        return np.zeros((0, 0, 4), dtype=np.float32)
+    u = np.linspace(0.0, 1.0, cols, dtype=np.float32)
+    v = np.linspace(0.0, 1.0, rows, dtype=np.float32)
+    u = (u[:-1] + u[1:]) * 0.5
+    v = (v[:-1] + v[1:]) * 0.5
     uu, vv = np.meshgrid(u, v, indexing="xy")
     return _sample_texture(texture, uu, vv, repeat=repeat, flip_v=flip_v)
+
+
+def _apply_cut_texture_mask(mesh, so: SoftObject, base_colors: np.ndarray):
+    cell_mask = so.get_cut_cell_mask()
+    if cell_mask is None:
+        return
+    colors = base_colors.copy()
+    colors[~cell_mask] = 0.0
+    colors_flat = colors.reshape(-1, 4)
+    array_set = False
+    try:
+        mesh.set_array(colors_flat)
+        array_set = True
+    except Exception:
+        pass
+    if not array_set:
+        try:
+            mesh._A = None
+        except Exception:
+            pass
+    mesh.set_facecolors(colors_flat)
+    mesh.set_edgecolors("none")
+    mesh.stale = True
 
 
 def _update_texture_mesh(mesh, pos: np.ndarray):
@@ -372,7 +393,6 @@ def run_sim_cuda(args):
     pt_fixed_idx = _compute_fixed_points(row, col, num_fixed, active_mask)
 
     SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx, active_mask=active_mask)
-    build_fracture(SO, row, col)
 
     use_texture = args.texture is not None or args.draw_mode == "texture"
     texture_img = None
@@ -468,15 +488,13 @@ def run_sim(args):
     pt_fixed_idx = _compute_fixed_points(row, col, num_fixed, active_mask)
 
     SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx, active_mask=active_mask)
-    fracture_info = build_fracture(SO, row, col)
-
     fig, ax = None, None
     line_canvas = None
     fixed_scatter = None
     selected_scatter = None
-    fracture_line = None
     inter = None
     texture_mesh = None
+    texture_base = None
 
     if args.show:
         if plt is None:
@@ -489,28 +507,37 @@ def run_sim(args):
         ax.set_title("Soft Object Simulation (NumPy)")
         if args.texture:
             tex_img = _load_texture_image(args.texture)
-            tex_colors = _build_texture_colors(
+            tex_colors = _build_texture_cell_colors(
                 SO.rows,
                 SO.cols,
                 tex_img,
                 repeat=args.texture_repeat,
             )
-            alpha = float(np.clip(args.texture_alpha, 0.0, 1.0))
-            if alpha < 1.0:
-                tex_colors[..., 3] *= alpha
-            if active_mask is not None:
-                tex_colors = tex_colors.copy()
-                tex_colors[~active_mask] = 0.0
-            texture_mesh = ax.pcolormesh(
-                SO.pos[..., 0],
-                SO.pos[..., 1],
-                tex_colors,
-                shading="gouraud",
-                edgecolors="none",
-                linewidth=0.0,
-                antialiased=False,
-            )
-            texture_mesh.set_zorder(1)
+            if tex_colors.size:
+                alpha = float(np.clip(args.texture_alpha, 0.0, 1.0))
+                if alpha < 1.0:
+                    tex_colors[..., 3] *= alpha
+                if active_mask is not None:
+                    cell_active = (
+                        active_mask[:-1, :-1]
+                        & active_mask[:-1, 1:]
+                        & active_mask[1:, :-1]
+                        & active_mask[1:, 1:]
+                    )
+                    tex_colors = tex_colors.copy()
+                    tex_colors[~cell_active] = 0.0
+                texture_base = tex_colors
+                texture_mesh = ax.pcolormesh(
+                    SO.pos[..., 0],
+                    SO.pos[..., 1],
+                    tex_colors,
+                    shading="flat",
+                    edgecolors="none",
+                    linewidth=0.0,
+                    antialiased=False,
+                )
+                texture_mesh.set_zorder(1)
+                _apply_cut_texture_mask(texture_mesh, SO, texture_base)
 
         fixed_pts = np.argwhere(SO.fixed_mode)
         fixed_xy = SO.pos[fixed_pts[:, 0], fixed_pts[:, 1], :]
@@ -522,16 +549,10 @@ def run_sim(args):
             line_canvas.set_visible(False)
         elif grid_alpha < 1.0:
             line_canvas.set_alpha(grid_alpha)
-        frac_canvas = build_fracture_canvas(SO, fracture_info)
-        if frac_canvas is None:
-            (fracture_line,) = ax.plot([], [], "w-", linewidth=3)
-        else:
-            (fracture_line,) = ax.plot(frac_canvas[:, 0], frac_canvas[:, 1], "w-", linewidth=3)
         selected_scatter = ax.scatter([], [], c="b", s=40, label="Selected")
         line_canvas.set_zorder(2)
-        fracture_line.set_zorder(3)
-        fixed_scatter.set_zorder(4)
-        selected_scatter.set_zorder(5)
+        fixed_scatter.set_zorder(3)
+        selected_scatter.set_zorder(4)
         inter = MouseInteractor(ax, SO)
 
     t0 = time.time()
@@ -560,17 +581,12 @@ def run_sim(args):
         if should_draw and ax is not None:
             if texture_mesh is not None:
                 _update_texture_mesh(texture_mesh, SO.pos)
+                if texture_base is not None:
+                    _apply_cut_texture_mask(texture_mesh, SO, texture_base)
             canvas = _get_canvas(SO, args.draw_mode, args.draw_skip)
             line_canvas.set_data(canvas[:, 0], canvas[:, 1])
             if inter:
                 inter.cut_pending = False
-
-            if fracture_line is not None:
-                frac_canvas = build_fracture_canvas(SO, fracture_info)
-                if frac_canvas is None:
-                    fracture_line.set_data([], [])
-                else:
-                    fracture_line.set_data(frac_canvas[:, 0], frac_canvas[:, 1])
 
             if fixed_scatter is not None:
                 fixed_pts = np.argwhere(SO.fixed_mode)
@@ -616,8 +632,8 @@ def _get_canvas(SO: SoftObject, mode: str, draw_skip: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=10)
-    parser.add_argument("--cols", type=int, default=10)
+    parser.add_argument("--rows", type=int, default=20)
+    parser.add_argument("--cols", type=int, default=20)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--damping", type=float, default=0.5)
