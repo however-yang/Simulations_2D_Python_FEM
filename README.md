@@ -1,10 +1,10 @@
-# Python 版软体仿真（NumPy）
+# Python 版软体仿真（GPU‑only / CUDA‑OpenGL 分支）
 
 [![Python](https://img.shields.io/badge/Python-3.6+-blue.svg)](https://www.python.org/)
 [![NumPy](https://img.shields.io/badge/NumPy-1.19+-green.svg)](https://numpy.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于弹簧‑质点网格的 2D 软体仿真。核心计算使用 NumPy，默认只依赖 `numpy` 和 `matplotlib`。支持纹理贴图、鼠标交互、形状预选，以及 CUDA‑OpenGL 的 GPU 纹理渲染与切割遮罩。
+本分支专注于 **CUDA‑OpenGL GPU 渲染**。主仿真仍为 NumPy 计算，但渲染与交互全部通过 GLFW + OpenGL 实现；不再提供 Matplotlib 实时渲染，只保留 Matplotlib Lasso 作为可选的形状预选工具。
 
 ## 📋 目录
 
@@ -19,28 +19,27 @@
 
 ## ✨ 特性
 
-- 🎯 **纯 NumPy 计算**：主仿真无需 PyTorch/CUDA
+- ⚡ **GPU‑only 渲染**：OpenGL 纹理网格 + CUDA 互操作
 - 🖱️ **交互式仿真**：左键拖拽施加外力
 - ✂️ **交互式切割**：右键移除单元格并触发弹簧断裂
 - 🖼️ **纹理贴图**：纹理随网格形变实时更新
-- 🧭 **形状选择**：运行前用鼠标圈选非矩形区域
-- ⚡ **CUDA‑OpenGL 渲染**：GPU 纹理网格渲染 + 片元遮罩裁剪
+- 🧭 **形状选择**：运行前圈选非矩形区域（可选）
 
 ## 📦 安装
 
 ### 基础依赖
 
 ```bash
-pip install numpy matplotlib
+pip install numpy
 ```
 
-纹理加载若不安装 `matplotlib`，可使用 Pillow：
+### 纹理加载（自定义图片时需要）
 
 ```bash
 pip install pillow
 ```
 
-### 可选依赖（CUDA‑OpenGL 渲染）
+### CUDA‑OpenGL 渲染（必需）
 
 ```bash
 pip install pycuda PyOpenGL glfw
@@ -57,36 +56,38 @@ PY
 
 若输出为 `False`，需从源码重新编译 PyCUDA 并开启 GL 支持（确保 `CUDA_ENABLE_GL = True`）。
 
+### 形状预选（可选）
+
+```bash
+pip install matplotlib
+```
+
+仅在使用 `--select-shape` 时需要 Matplotlib。
+
 ## 🚀 快速开始
-
-### 仅计算（不显示）
-
-```bash
-python3 main.py --steps 200
-```
-
-### Matplotlib 可视化
-
-```bash
-python3 main.py --show --rows 100 --cols 100 --steps 2000
-```
-
-### 纹理贴图（内置棋盘格）
-
-```bash
-python3 main.py --show --texture --steps 2000
-```
-
-### 纹理贴图（自定义图片）
-
-```bash
-python3 main.py --show --texture ./texture.jpg --grid-alpha 0 --steps 2000
-```
 
 ### CUDA‑OpenGL 纹理渲染（GPU）
 
 ```bash
-python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --draw-interval 1
+python3 main.py --draw-mode texture --texture ./texture.jpg --draw-interval 1
+```
+
+### 点模式（最快）
+
+```bash
+python3 main.py --draw-mode points
+```
+
+### 轮廓模式
+
+```bash
+python3 main.py --draw-mode contour
+```
+
+### 运行前圈选形状
+
+```bash
+python3 main.py --select-shape --draw-mode texture --texture ./texture.jpg
 ```
 
 ## 🖱️ 交互操作
@@ -99,28 +100,25 @@ python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --dr
 
 ```bash
 # 小网格快速测试
-python3 main.py --show --rows 50 --cols 50 --steps 1000
+python3 main.py --rows 50 --cols 50 --steps 1000
 
 # 大网格高精度仿真
-python3 main.py --show --rows 200 --cols 200 --steps 5000 --draw-interval 30
-
-# 仅显示边界轮廓
-python3 main.py --show --draw-mode contour --steps 2000
+python3 main.py --rows 200 --cols 200 --steps 5000 --draw-interval 30
 
 # 仅显示节点
-python3 main.py --show --draw-mode points --steps 2000
+python3 main.py --draw-mode points
 
-# 贴图纹理（默认棋盘格）
-python3 main.py --show --texture --steps 2000
+# 仅显示轮廓
+python3 main.py --draw-mode contour
 
-# 贴图纹理（自定义图片）
-python3 main.py --show --texture ./texture.jpg --steps 2000
+# 纹理贴图（默认棋盘格）
+python3 main.py --draw-mode texture --texture
 
-# 运行前圈选形状（按 Enter 确认）
-python3 main.py --show --select-shape --steps 2000
+# 纹理贴图（自定义图片）
+python3 main.py --draw-mode texture --texture ./texture.jpg
 
-# CUDA‑OpenGL 纹理渲染（GPU）
-python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --steps 2000
+# 运行前圈选形状
+python3 main.py --select-shape --draw-mode texture --texture ./texture.jpg
 ```
 
 ## ⚙️ 参数说明
@@ -147,21 +145,18 @@ python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --st
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--steps` | 迭代步数 | 20000 |
-| `--show` | 开启 Matplotlib 可视化 | False |
 | `--select-shape` | 运行前鼠标圈选形状 | False |
 
 ### 渲染参数
 
 | 参数 | 说明 | 默认值 | 可选值 |
 |------|------|--------|--------|
-| `--draw-mode` | 渲染模式 | `full` | `full`, `contour`, `points`, `texture` |
+| `--draw-mode` | 渲染模式 | `points` | `points`, `contour`, `texture`, `full` |
 | `--draw-interval` | 绘图更新间隔 | 15 | 正整数 |
 | `--draw-skip` | 绘图下采样 | 1 | 正整数 |
 | `--texture` | 纹理图片路径（仅给参数时使用内置棋盘格） | 无 | 路径或省略参数 |
 | `--texture-alpha` | 纹理透明度 | 1.0 | 0~1 |
 | `--texture-repeat` | 纹理平铺次数 | 1 | 正整数 |
-| `--grid-alpha` | 网格线透明度 | 自动 | 0~1 |
-| `--renderer` | 渲染后端 | `mpl` | `mpl`, `cuda` |
 
 ### 交互参数
 
@@ -169,6 +164,8 @@ python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --st
 |------|------|--------|
 | `--drag-k` | 鼠标拖拽虚拟弹簧系数 | 5.0 |
 | `--pin-drag` | 拖拽时直接将节点钉在鼠标位置 | False |
+
+> 说明：`full` 在 GPU‑only 分支等同于 `points`，保留该选项仅为兼容旧命令。
 
 ## 🔧 实现细节
 
@@ -189,30 +186,31 @@ python3 main.py --renderer cuda --draw-mode texture --texture ./texture.jpg --st
 - 右键点击会将最近的**单元格**加入 `removed_cells`。
 - **水平/垂直弹簧**：仅当两侧相邻单元格都被移除时断裂；边缘弹簧仅需一侧单元格移除即断裂。
 - **对角弹簧**：所在单元格被移除即断裂。
-- `cut_masks` 用于屏蔽力计算与绘制。
+- `cut_masks` 用于屏蔽力计算与 GPU 绘制。
 
-### 纹理渲染
+### CUDA‑OpenGL 渲染
 
-- Matplotlib：用 `pcolormesh` 绘制单元格纹理，依据 `get_cut_cell_mask()` 将被移除的单元格透明化。
-- CUDA‑OpenGL：上传 `removed_cells` 为 mask 纹理，片元着色器中基于单元格索引 `discard`，从 GPU 侧实时裁剪纹理区域。
+- 使用 VBO 存储变形后的顶点坐标，UV 由网格索引生成。
+- `removed_cells` 上传为 **mask 纹理**，片元着色器中按单元格索引 `discard` 实现实时裁剪。
+- `CUDAGLInteractor` 负责 GLFW 的鼠标/键盘事件，更新拖拽与切割状态。
 
 ### 形状选择
 
-运行前弹出 Lasso 选择窗口，生成 `active_mask`：
+使用 Matplotlib Lasso 选择窗口生成 `active_mask`：
 - 仿真只在选区内计算
 - 固定点优先选在选区最左侧节点
-- 纹理与网格仅显示有效区域
+- CUDA 纹理模式仅对选区内的完整单元生成三角面片
 
 ## 📁 项目结构
 
 ```
 Simulations_2D_Python/
-├── main.py              # 主入口：参数解析、仿真循环、Matplotlib 渲染
+├── main.py              # GPU-only 入口：解析参数并直接运行 CUDA 渲染
 ├── soft_object.py       # 软体网格核心：力计算、切割与遮罩
 ├── cuda_gl_renderer.py  # CUDA‑OpenGL 渲染器：VBO + shader + mask 纹理
-├── gpu_renderer.py      # 实验性 Vispy 渲染器（当前未接入 CLI）
+├── gpu_renderer.py      # 旧的 Vispy 实验渲染器（当前未接入 CLI）
 ├── texture.jpg          # 示例纹理
-├── README.md            # 项目说明文档
+├── README.md            # 分支说明
 └── .gitignore           # Git 忽略配置
 ```
 
@@ -226,4 +224,4 @@ Simulations_2D_Python/
 
 ---
 
-**注意**：本项目为 MATLAB 版本的 Python 移植，保持了相同的物理仿真逻辑与数据结构。
+**注意**：本分支聚焦 GPU 渲染；若需要 Matplotlib 实时渲染版本，请切换到 CPU-only 分支。
