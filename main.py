@@ -69,7 +69,7 @@ def _select_shape_mask(rows: int, cols: int, edge_len: float) -> Optional[np.nda
     ax.set_xlim(-0.1, max(rows, cols) * edge_len + 0.1)
     ax.set_ylim(-0.1, max(rows, cols) * edge_len + 0.1)
     ax.scatter(pts[:, 0], pts[:, 1], s=4, c="0.7")
-    ax.set_title("拖拽选择形状，按 Enter 确认，按 Esc 重置")
+    ax.set_title("Drag and select shape, press Enter to confirm, press Esc to reset")
     selected_scatter = ax.scatter([], [], s=6, c="C0")
     state = {"mask": None}
 
