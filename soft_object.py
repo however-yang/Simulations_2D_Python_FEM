@@ -379,6 +379,35 @@ class SoftObject:
         c = int(flat_idx % self.cols)
         return r, c
 
+    def toggle_fixed(self, r: int, c: int, force: Optional[bool] = None) -> bool:
+        if r < 0 or r >= self.rows or c < 0 or c >= self.cols:
+            return False
+        if hasattr(self, "active") and not self.active[r, c]:
+            return False
+        if force is None:
+            new_state = not self.fixed_mode[r, c]
+        else:
+            new_state = bool(force)
+        if new_state == self.fixed_mode[r, c]:
+            return False
+        self.fixed_mode[r, c] = new_state
+        if new_state:
+            self.pos_old[r, c] = self.pos[r, c]
+            self.vel[r, c, :] = 0.0
+            self.acc[r, c, :] = 0.0
+            self.force_ext[r, c, :] = 0.0
+        return True
+
+    def toggle_fixed_nearest(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
+        r, c = self.find_closest_node(x, y)
+        if r < 0 or c < 0:
+            return False
+        if max_dist is not None:
+            dist = float(np.linalg.norm(self.pos[r, c] - np.array([x, y], dtype=np.float64)))
+            if dist > max_dist:
+                return False
+        return self.toggle_fixed(r, c)
+
     # ------------------------------------------------------------------ 辅助接口
     def set_force_ext(self, r: int, c: int, fx: float, fy: float):
         self.force_ext[r, c, 0] = fx

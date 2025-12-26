@@ -98,20 +98,6 @@ def _select_shape_mask(rows: int, cols: int, edge_len: float) -> Optional[np.nda
     return state["mask"]
 
 
-def _compute_fixed_points(
-    rows: int, cols: int, num_fixed: int, active_mask: Optional[np.ndarray]
-) -> np.ndarray:
-    if active_mask is None:
-        return np.stack([np.arange(1, num_fixed + 1), np.ones(num_fixed, dtype=int)], axis=1)
-    active_idx = np.argwhere(active_mask)
-    if active_idx.size == 0:
-        raise ValueError("选择区域为空，无法生成固定点。")
-    order = np.lexsort((active_idx[:, 0], active_idx[:, 1]))
-    active_idx = active_idx[order]
-    chosen = active_idx[: min(num_fixed, active_idx.shape[0])]
-    return chosen + 1  # 转为 1-based
-
-
 def apply_mouse_force(
     SO: SoftObject, inter, drag_k: float, pin_drag: bool = False
 ) -> Optional[Tuple[int, int]]:
@@ -166,15 +152,7 @@ def run_sim_cuda(args):
         if active_mask is not None and not np.any(active_mask):
             raise ValueError("选择区域为空，无法开始仿真。")
 
-    if row >= 50:
-        num_fixed = 15
-    elif row >= 20:
-        num_fixed = 10
-    else:
-        num_fixed = 5
-    pt_fixed_idx = _compute_fixed_points(row, col, num_fixed, active_mask)
-
-    SO = SoftObject(col, row, edge_len, stiffness, damping, pt_fixed_idx, active_mask=active_mask)
+    SO = SoftObject(col, row, edge_len, stiffness, damping, None, active_mask=active_mask)
 
     use_texture = args.texture is not None or args.draw_mode == "texture"
     texture_img = None

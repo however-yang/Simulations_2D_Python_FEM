@@ -4,7 +4,7 @@ Requires: pip install pycuda PyOpenGL glfw
 Notes:
 - Must be created after a CUDA-capable device is available.
 - Supports draw_mode 'points', 'contour', or 'texture' (textured mesh).
-- Interaction: left-click selects nearest node; drag to move cursor; 'q' closes window.
+- Interaction: left-click selects nearest node; drag to move cursor; press 'f' to toggle fixed; right-click cuts; 'q' closes window.
 """
 from typing import Optional, Tuple
 import numpy as np
@@ -59,6 +59,12 @@ class CUDAGLInteractor:
         self.mouse_pos = (wx, wy)
 
     def _on_key(self, window, key, scancode, action, mods):
+        if key == glfw.KEY_F and action == glfw.PRESS:
+            if self.selected_idx is not None:
+                r, c = self.selected_idx
+                if r >= 0 and c >= 0 and self.so.toggle_fixed(r, c):
+                    self.cut_pending = True
+            return
         if key == glfw.KEY_SPACE:
             if action == glfw.PRESS:
                 self.space_down = True
@@ -493,6 +499,27 @@ class CUDAGLRenderer:
         mapped.unmap()
         return v_count
 
+    def _draw_fixed_points(self, so):
+        fixed = getattr(so, "fixed_mode", None)
+        if fixed is None or not np.any(fixed):
+            return
+        coords = np.ascontiguousarray(so.pos[fixed], dtype=np.float32)
+        if coords.size == 0:
+            return
+        was_tex = GL.glIsEnabled(GL.GL_TEXTURE_2D)
+        if was_tex:
+            GL.glDisable(GL.GL_TEXTURE_2D)
+        GL.glPointSize(6.0)
+        GL.glColor3f(0.0, 0.0, 0.0)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
+        GL.glVertexPointer(2, GL.GL_FLOAT, 0, coords)
+        GL.glDrawArrays(GL.GL_POINTS, 0, coords.shape[0])
+        GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
+        GL.glColor3f(1.0, 1.0, 1.0)
+        if was_tex:
+            GL.glEnable(GL.GL_TEXTURE_2D)
+
     def update(self, so, selected_idx: Optional[Tuple[int, int]]):
         import pycuda.driver as cuda
 
@@ -557,6 +584,7 @@ class CUDAGLRenderer:
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glUseProgram(0)
+            self._draw_fixed_points(so)
             glfw.swap_buffers(self.window)
             glfw.poll_events()
             return
@@ -579,6 +607,7 @@ class CUDAGLRenderer:
             GL.glDrawArrays(GL.GL_POINTS, 0, v_count)
         GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        self._draw_fixed_points(so)
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
