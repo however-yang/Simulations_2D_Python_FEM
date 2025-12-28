@@ -152,7 +152,18 @@ def run_sim_cuda(args):
         if active_mask is not None and not np.any(active_mask):
             raise ValueError("选择区域为空，无法开始仿真。")
 
-    SO = SoftObject(col, row, edge_len, stiffness, damping, None, active_mask=active_mask)
+    SO = SoftObject(
+        col,
+        row,
+        edge_len,
+        stiffness,
+        damping,
+        None,
+        active_mask=active_mask,
+        fem_scale=args.fem_scale,
+        poisson=args.poisson,
+        fem_device=args.fem_device,
+    )
 
     use_texture = args.texture is not None or args.draw_mode == "texture"
     texture_img = None
@@ -218,10 +229,18 @@ def run_sim_cuda(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=20)
-    parser.add_argument("--cols", type=int, default=20)
+    parser.add_argument("--rows", type=int, default=200)
+    parser.add_argument("--cols", type=int, default=200)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
+    parser.add_argument("--fem-scale", type=float, default=5.0, help="FEM 刚度缩放（乘到 k）")
+    parser.add_argument("--poisson", type=float, default=0.45, help="泊松比 (0~0.49)")
+    parser.add_argument(
+        "--fem-device",
+        choices=["cpu", "gpu"],
+        default="gpu",
+        help="FEM 计算设备（gpu 需要 CuPy）",
+    )
     parser.add_argument("--damping", type=float, default=0.5)
     parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument("--ts", type=float, default=0.005)

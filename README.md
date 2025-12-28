@@ -4,7 +4,7 @@
 [![NumPy](https://img.shields.io/badge/NumPy-1.19+-green.svg)](https://numpy.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-本分支专注于 **CUDA‑OpenGL GPU 渲染**。主仿真仍为 NumPy 计算，但渲染与交互全部通过 GLFW + OpenGL 实现；不再提供 Matplotlib 实时渲染，只保留 Matplotlib Lasso 作为可选的形状预选工具。
+本分支专注于 **CUDA‑OpenGL GPU 渲染**。主仿真默认使用 **CuPy 在 GPU 上进行 FEM 计算**（可通过 `--fem-device cpu` 回退到 NumPy），渲染与交互全部通过 GLFW + OpenGL 实现；不再提供 Matplotlib 实时渲染，只保留 Matplotlib Lasso 作为可选的形状预选工具。
 
 ## 📋 目录
 
@@ -21,6 +21,7 @@
 
 - ⚡ **GPU‑only 渲染**：OpenGL 纹理网格 + CUDA 互操作
 - 🖱️ **交互式仿真**：左键拖拽施加外力
+- 🧩 **FEM 核心**：Corotated 三角形单元 + 隐式积分（默认 CuPy GPU 计算）
 - 📌 **固定点切换**：运行中按 `f` 键选择/取消固定节点
 - ✂️ **交互式切割**：右键移除单元格并触发弹簧断裂
 - 🖼️ **纹理贴图**：纹理随网格形变实时更新
@@ -33,6 +34,14 @@
 ```bash
 pip install numpy
 ```
+
+### FEM GPU 计算（默认）
+
+```bash
+pip install cupy-cuda11x
+```
+
+根据本机 CUDA 版本选择对应的 `cupy-cudaXXX` 包；若只想使用 CPU，可在运行时指定 `--fem-device cpu`。
 
 ### 纹理加载（自定义图片时需要）
 
@@ -140,9 +149,17 @@ python3 main.py --select-shape --draw-mode texture --texture ./texture.jpg
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--k` | 弹簧刚度系数 | 10.0 |
+| `--fem-scale` | FEM 刚度缩放（乘到 k） | 1.0 |
+| `--poisson` | 泊松比 | 0.3 |
 | `--damping` | 阻尼系数 | 0.5 |
 | `--mass` | 节点质量 | 0.01 |
 | `--ts` | 时间步长 | 0.005 |
+
+### 计算参数
+
+| 参数 | 说明 | 默认值 | 可选值 |
+|------|------|--------|--------|
+| `--fem-device` | FEM 计算设备 | `gpu` | `cpu`, `gpu` |
 
 ### 仿真参数
 
@@ -183,7 +200,7 @@ python3 main.py --select-shape --draw-mode texture --texture ./texture.jpg
 
 ### 力计算
 
-按 8 方向邻接计算弹簧力，结合阻尼与外力后更新 Verlet 积分。
+采用 **Corotated FEM**（三角形单元）计算内力，并使用隐式积分求解以增强整体耦合与稳定性。GPU 路径使用 CuPy 执行矩阵计算与 CG 迭代，结果同步到 CPU 供 OpenGL 更新。
 
 ### 切割逻辑（单元格移除）
 

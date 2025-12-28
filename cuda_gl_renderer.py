@@ -60,10 +60,13 @@ class CUDAGLInteractor:
 
     def _on_key(self, window, key, scancode, action, mods):
         if key == glfw.KEY_F and action == glfw.PRESS:
-            if self.selected_idx is not None:
-                r, c = self.selected_idx
-                if r >= 0 and c >= 0 and self.so.toggle_fixed(r, c):
-                    self.cut_pending = True
+            x, y = glfw.get_cursor_pos(window)
+            wx, wy = self._screen_to_world(x, y)
+            self.mouse_pos = (wx, wy)
+            self.selected_idx = self.so.find_closest_node(wx, wy)
+            r, c = self.selected_idx
+            if r >= 0 and c >= 0 and self.so.toggle_fixed(r, c):
+                self.cut_pending = True
             return
         if key == glfw.KEY_SPACE:
             if action == glfw.PRESS:
@@ -293,15 +296,27 @@ class CUDAGLRenderer:
         self.reg_buffer = None
         self._resize_vbo(1024)
 
+    def _push_cuda(self):
+        if self.cuda_ctx is not None:
+            self.cuda_ctx.push()
+
+    def _pop_cuda(self):
+        if self.cuda_ctx is not None:
+            self.cuda_ctx.pop()
+
     def _resize_vbo(self, vertex_count: int):
         import pycuda.gl as cudagl
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
-        buf_size = vertex_count * 2 * 4
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, buf_size, None, GL.GL_DYNAMIC_DRAW)
-        if self.reg_buffer is not None:
-            self.reg_buffer.unregister()
-        self.reg_buffer = cudagl.RegisteredBuffer(int(self.vbo))
-        self.vertex_capacity = vertex_count
+        self._push_cuda()
+        try:
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
+            buf_size = vertex_count * 2 * 4
+            GL.glBufferData(GL.GL_ARRAY_BUFFER, buf_size, None, GL.GL_DYNAMIC_DRAW)
+            if self.reg_buffer is not None:
+                self.reg_buffer.unregister()
+            self.reg_buffer = cudagl.RegisteredBuffer(int(self.vbo))
+            self.vertex_capacity = vertex_count
+        finally:
+            self._pop_cuda()
 
     def _pick_mask_format(self):
         if hasattr(GL, "GL_RED") and hasattr(GL, "GL_R8"):
@@ -484,19 +499,23 @@ class CUDAGLRenderer:
         if v_count > self.vertex_capacity:
             self._resize_vbo(int(v_count * 1.2))
 
-        mapped = self.reg_buffer.map()
-        ptr, size = mapped.device_ptr_and_size()
-        if bytes_needed > size:
-            mapped.unmap()
-            self._resize_vbo(v_count)
+        self._push_cuda()
+        try:
             mapped = self.reg_buffer.map()
             ptr, size = mapped.device_ptr_and_size()
+            if bytes_needed > size:
+                mapped.unmap()
+                self._resize_vbo(v_count)
+                mapped = self.reg_buffer.map()
+                ptr, size = mapped.device_ptr_and_size()
 
-        if is_torch:
-            cuda.memcpy_dtod(ptr, int(coords.data_ptr()), bytes_needed)
-        else:
-            cuda.memcpy_htod(ptr, coords)
-        mapped.unmap()
+            if is_torch:
+                cuda.memcpy_dtod(ptr, int(coords.data_ptr()), bytes_needed)
+            else:
+                cuda.memcpy_htod(ptr, coords)
+            mapped.unmap()
+        finally:
+            self._pop_cuda()
         return v_count
 
     def _draw_fixed_points(self, so):
@@ -509,8 +528,8 @@ class CUDAGLRenderer:
         was_tex = GL.glIsEnabled(GL.GL_TEXTURE_2D)
         if was_tex:
             GL.glDisable(GL.GL_TEXTURE_2D)
-        GL.glPointSize(6.0)
-        GL.glColor3f(0.0, 0.0, 0.0)
+        GL.glPointSize(7.0)
+        GL.glColor3f(0.1, 0.9, 1.0)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
         GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
         GL.glVertexPointer(2, GL.GL_FLOAT, 0, coords)
