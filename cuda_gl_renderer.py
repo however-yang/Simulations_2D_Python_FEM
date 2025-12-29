@@ -19,7 +19,7 @@ class CUDAGLInteractor:
         self.mouse_down = False
         self.space_down = False
         self.mouse_pos: Optional[Tuple[float, float]] = None
-        self.selected_idx: Optional[Tuple[int, int]] = None
+        self.selected_idx: Optional[int] = None
         self.quit = False
         self.cut_pending = False
         self.bounds = bounds  # (xmin, xmax, ymin, ymax)
@@ -64,8 +64,7 @@ class CUDAGLInteractor:
             wx, wy = self._screen_to_world(x, y)
             self.mouse_pos = (wx, wy)
             self.selected_idx = self.so.find_closest_node(wx, wy)
-            r, c = self.selected_idx
-            if r >= 0 and c >= 0 and self.so.toggle_fixed(r, c):
+            if self.selected_idx >= 0 and self.so.toggle_fixed(self.selected_idx):
                 self.cut_pending = True
             return
         if key == glfw.KEY_SPACE:
@@ -257,10 +256,12 @@ class CUDAGLRenderer:
         self.reg_buffer = None
         self.vertex_capacity = 0
         self.cuda_ctx = None
+        self.mesh_version = None
+        self.mesh_node_count = 0
         self._init_gl(self.rows, self.cols, self.edge_len)
         self._init_cuda()
         if self.draw_mode == "texture":
-            self._init_texture_mesh()
+            self._init_texture_resources()
 
     def _init_gl(self, rows: int, cols: int, edge_len: float):
         if not glfw.init():
@@ -430,33 +431,10 @@ class CUDAGLRenderer:
         else:
             self._last_removed_cells = removed.copy()
 
-    def _init_texture_mesh(self):
+    def _init_texture_resources(self):
         if self.rows < 2 or self.cols < 2:
             self.draw_mode = "points"
             return
-
-        self._resize_vbo(self.rows * self.cols)
-        uvs = _build_uvs(self.rows, self.cols, repeat=self.texture_repeat, flip_v=True)
-        grid_uvs = _build_grid_uvs(self.rows, self.cols)
-        indices = _build_triangle_indices(self.rows, self.cols, self.active_mask)
-        self.index_count = int(indices.size)
-        if self.index_count == 0:
-            self.draw_mode = "points"
-            return
-
-        self.uv_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.uv_vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, uvs.nbytes, uvs, GL.GL_STATIC_DRAW)
-
-        self.grid_uv_vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.grid_uv_vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, grid_uvs.nbytes, grid_uvs, GL.GL_STATIC_DRAW)
-
-        self.ebo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
-        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL.GL_STATIC_DRAW)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
-
         tex = self.texture_image if self.texture_image is not None else _make_checker_texture()
         tex_u8 = _as_uint8_rgba(tex)
         self.texture_id = GL.glGenTextures(1)
@@ -483,6 +461,76 @@ class CUDAGLRenderer:
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         self._init_mask_texture()
         self._init_shader_program()
+
+    def _sync_mesh_buffers(self, so):
+        if self.draw_mode != "texture":
+            return
+        if self.texture_id is None or self.mask_texture_id is None or self.shader is None:
+            self._init_texture_resources()
+
+        mesh_version = getattr(so, "_mesh_version", None)
+        node_count = int(getattr(so, "pos", np.zeros((0, 2))).shape[0])
+        if (
+            mesh_version is not None
+            and self.mesh_version == mesh_version
+            and self.mesh_node_count == node_count
+        ):
+            return
+
+        if node_count <= 0:
+            self.index_count = 0
+            self.mesh_version = mesh_version
+            self.mesh_node_count = node_count
+            return
+
+        grid_idx = getattr(so, "node_grid_index", None)
+        if grid_idx is None or grid_idx.size == 0:
+            self.index_count = 0
+            self.mesh_version = mesh_version
+            self.mesh_node_count = node_count
+            return
+
+        grid_idx = np.asarray(grid_idx, dtype=np.int64)
+        r = grid_idx // max(self.cols, 1)
+        c = grid_idx % max(self.cols, 1)
+        denom_c = max(self.cols - 1, 1)
+        denom_r = max(self.rows - 1, 1)
+        u = c.astype(np.float32) / float(denom_c)
+        v = r.astype(np.float32) / float(denom_r)
+        grid_uvs = np.stack([u, v], axis=1).astype(np.float32)
+        uvs = grid_uvs.copy()
+        uvs[:, 1] = 1.0 - uvs[:, 1]
+        uvs *= float(self.texture_repeat)
+
+        indices = getattr(so, "_tri_indices", None)
+        if indices is None or indices.size == 0:
+            indices = np.zeros((0,), dtype=np.uint32)
+        else:
+            indices = np.asarray(indices, dtype=np.uint32).ravel()
+
+        if node_count > self.vertex_capacity:
+            self._resize_vbo(int(node_count * 1.2))
+
+        if self.uv_vbo is None:
+            self.uv_vbo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.uv_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, uvs.nbytes, uvs, GL.GL_STATIC_DRAW)
+
+        if self.grid_uv_vbo is None:
+            self.grid_uv_vbo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.grid_uv_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, grid_uvs.nbytes, grid_uvs, GL.GL_STATIC_DRAW)
+
+        if self.ebo is None:
+            self.ebo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL.GL_STATIC_DRAW)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+
+        self.index_count = int(indices.size)
+        self.mesh_version = mesh_version
+        self.mesh_node_count = node_count
 
     def _upload_positions(self, coords, cuda) -> int:
         if hasattr(coords, "data_ptr") and hasattr(coords, "numel"):
@@ -539,15 +587,25 @@ class CUDAGLRenderer:
         if was_tex:
             GL.glEnable(GL.GL_TEXTURE_2D)
 
-    def update(self, so, selected_idx: Optional[Tuple[int, int]]):
+    def update(self, so, selected_idx: Optional[int]):
         import pycuda.driver as cuda
 
         if self.draw_mode == "texture":
+            self._sync_mesh_buffers(so)
             coords = so.pos.reshape(-1, 2)
             self._upload_positions(coords, cuda)
             self._update_mask_from_so(so)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-            if self.shader is None or self.texture_id is None or self.mask_texture_id is None:
+            if (
+                self.shader is None
+                or self.texture_id is None
+                or self.mask_texture_id is None
+                or self.uv_vbo is None
+                or self.grid_uv_vbo is None
+                or self.ebo is None
+                or self.index_count == 0
+            ):
+                self._draw_fixed_points(so)
                 glfw.swap_buffers(self.window)
                 glfw.poll_events()
                 return
@@ -612,8 +670,8 @@ class CUDAGLRenderer:
             canvas = so.drawSoftObjectContour()
         else:
             canvas = so.drawSoftObjectPt()
-        if self.draw_skip > 1:
-            canvas = canvas[:: self.draw_skip]
+            if self.draw_skip > 1:
+                canvas = canvas[:: self.draw_skip]
         v_count = self._upload_positions(canvas, cuda)
 
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
@@ -621,7 +679,7 @@ class CUDAGLRenderer:
         GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
         GL.glVertexPointer(2, GL.GL_FLOAT, 0, None)
         if self.draw_mode == "contour":
-            GL.glDrawArrays(GL.GL_LINE_LOOP, 0, v_count)
+            GL.glDrawArrays(GL.GL_LINES, 0, v_count)
         else:
             GL.glDrawArrays(GL.GL_POINTS, 0, v_count)
         GL.glDisableClientState(GL.GL_VERTEX_ARRAY)

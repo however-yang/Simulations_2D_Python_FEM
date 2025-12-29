@@ -1,6 +1,6 @@
 import argparse
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -99,37 +99,145 @@ def _select_shape_mask(rows: int, cols: int, edge_len: float) -> Optional[np.nda
 
 
 def apply_mouse_force(
-    SO: SoftObject, inter, drag_k: float, pin_drag: bool = False
-) -> Optional[Tuple[int, int]]:
-    if inter is None or inter.selected_idx is None:
+    SO: SoftObject,
+    inter,
+    drag_k: float,
+    pin_drag: bool = False,
+    drag_sigma: Optional[float] = None,
+    drag_radius: Optional[float] = None,
+) -> Optional[int]:
+    if inter is None:
         return None
 
-    r, c = inter.selected_idx
-    if r < 0 or r >= SO.rows or c < 0 or c >= SO.cols:
+    use_gpu = getattr(SO, "_use_gpu", False) and getattr(SO, "_cp", None) is not None
+    if not use_gpu:
+        prev_mask = getattr(inter, "_drag_mask", None)
+        if prev_mask is not None:
+            if prev_mask.shape[0] == SO.force_ext.shape[0]:
+                SO.force_ext[prev_mask] = 0.0
+            inter._drag_mask = None
+
+        if inter.selected_idx is None:
+            return None
+
+        idx = inter.selected_idx
+        if idx < 0 or idx >= SO.pos.shape[0]:
+            return None
+
+        if hasattr(SO, "active") and not SO.active[idx]:
+            return None
+
+        if not inter.mouse_down or inter.mouse_pos is None:
+            return idx
+
+        if SO.fixed_mode[idx]:
+            return idx
+
+        target = np.array(inter.mouse_pos, dtype=np.float64)
+        if pin_drag:
+            SO.pos[idx] = target
+            SO.pos_old[idx] = target
+            SO.vel[idx] = 0.0
+            SO.acc[idx] = 0.0
+            SO.force_ext[idx, :] = 0.0
+        else:
+            if drag_sigma is None or drag_sigma <= 0.0:
+                disp = target - SO.pos[idx]
+                SO.force_ext[idx, :] = disp * drag_k
+                mask = np.zeros((SO.pos.shape[0],), dtype=bool)
+                mask[idx] = True
+                inter._drag_mask = mask
+                return idx
+
+            sigma = float(drag_sigma)
+            sigma2 = sigma * sigma
+            radius = drag_radius
+            if radius is None or radius <= 0.0:
+                radius = sigma * 3.0
+            radius2 = radius * radius
+
+            center = SO.pos[idx]
+            diff = SO.pos - center
+            dist2 = np.sum(diff * diff, axis=1)
+            mask = dist2 <= radius2
+            if hasattr(SO, "active"):
+                mask &= SO.active
+            mask &= ~SO.fixed_mode
+            if not np.any(mask):
+                return idx
+
+            weights = np.exp(-0.5 * dist2[mask] / sigma2)
+            disp = target - SO.pos[mask]
+            SO.force_ext[mask] = disp * (drag_k * weights[:, None])
+            inter._drag_mask = mask
+        return idx
+
+    cp = SO._cp
+    cp.cuda.Device().use()
+    force_ext_gpu = getattr(SO, "_force_ext_gpu", None)
+    if inter.selected_idx is None:
+        if force_ext_gpu is not None:
+            force_ext_gpu.fill(0.0)
         return None
 
-    if hasattr(SO, "active") and not SO.active[r, c]:
+    idx = inter.selected_idx
+    if idx < 0 or idx >= SO.pos.shape[0]:
         return None
 
-    SO.clear_force_ext(r, c)
+    if hasattr(SO, "active") and not SO.active[idx]:
+        return None
 
     if not inter.mouse_down or inter.mouse_pos is None:
-        return (r, c)
+        if force_ext_gpu is not None:
+            force_ext_gpu.fill(0.0)
+        return idx
 
-    if SO.fixed_mode[r, c]:
-        return (r, c)
+    if SO.fixed_mode[idx]:
+        if force_ext_gpu is not None:
+            force_ext_gpu.fill(0.0)
+        return idx
 
     target = np.array(inter.mouse_pos, dtype=np.float64)
     if pin_drag:
-        SO.pos[r, c] = target
-        SO.pos_old[r, c] = target
-        SO.vel[r, c] = 0.0
-        SO.acc[r, c] = 0.0
-        SO.force_ext[r, c, :] = 0.0
-    else:
-        disp = target - SO.pos[r, c]
-        SO.force_ext[r, c, :] = disp * drag_k
-    return (r, c)
+        SO.pos[idx] = target
+        SO.pos_old[idx] = target
+        SO.vel[idx] = 0.0
+        SO.acc[idx] = 0.0
+        if force_ext_gpu is not None:
+            force_ext_gpu.fill(0.0)
+        return idx
+
+    if force_ext_gpu is None:
+        force_ext_gpu = cp.zeros((SO.pos.shape[0], 2), dtype=cp.float64)
+        SO._force_ext_gpu = force_ext_gpu
+
+    if drag_sigma is None or drag_sigma <= 0.0:
+        disp = target - SO.pos[idx]
+        force_ext_gpu.fill(0.0)
+        force_ext_gpu[idx, :] = disp * drag_k
+        return idx
+
+    sigma = float(drag_sigma)
+    sigma2 = sigma * sigma
+    radius = drag_radius
+    if radius is None or radius <= 0.0:
+        radius = sigma * 3.0
+    radius2 = radius * radius
+
+    pos_gpu = cp.asarray(SO.pos, dtype=cp.float64)
+    center = pos_gpu[idx]
+    diff = pos_gpu - center
+    dist2 = cp.sum(diff * diff, axis=1)
+    mask = dist2 <= radius2
+    if hasattr(SO, "active"):
+        mask &= cp.asarray(SO.active)
+    mask &= ~cp.asarray(SO.fixed_mode)
+
+    weights = cp.exp(-0.5 * dist2 / sigma2)
+    weights = cp.where(mask, weights, 0.0)
+    disp = cp.asarray(target, dtype=cp.float64) - pos_gpu
+    force_ext_gpu[...] = disp * (drag_k * weights[..., None])
+    return idx
 
 
 def run_sim_cuda(args):
@@ -163,6 +271,7 @@ def run_sim_cuda(args):
         fem_scale=args.fem_scale,
         poisson=args.poisson,
         fem_device=args.fem_device,
+        sleep_eps=args.sleep_eps,
     )
 
     use_texture = args.texture is not None or args.draw_mode == "texture"
@@ -193,19 +302,29 @@ def run_sim_cuda(args):
     )
     inter = CUDAGLInteractor(renderer, SO, renderer.bounds)
 
+    drag_sigma = args.drag_sigma
+    if drag_sigma is None:
+        drag_sigma = edge_len * 8.0  # 增大默认影响范围，使多点牵拉效果更明显
+
     t0 = time.time()
-    last_force_idx: Optional[Tuple[int, int]] = None
+    last_force_idx: Optional[int] = None
     steps_done = 0
 
     try:
         for t in range(args.steps):
             inter.process_events()
-            if inter.selected_idx is not None and last_force_idx and inter.selected_idx != last_force_idx:
-                r_prev, c_prev = last_force_idx
-                if 0 <= r_prev < SO.rows and 0 <= c_prev < SO.cols:
-                    SO.clear_force_ext(r_prev, c_prev)
+            if inter.selected_idx is not None and last_force_idx is not None and inter.selected_idx != last_force_idx:
+                if 0 <= last_force_idx < SO.pos.shape[0]:
+                    SO.clear_force_ext(last_force_idx)
                 last_force_idx = None
-            last_force_idx = apply_mouse_force(SO, inter, args.drag_k, pin_drag=args.pin_drag)
+            last_force_idx = apply_mouse_force(
+                SO,
+                inter,
+                args.drag_k,
+                pin_drag=args.pin_drag,
+                drag_sigma=drag_sigma,
+                drag_radius=args.drag_radius,
+            )
 
             SO.update_soft_object(mass, ts)
 
@@ -214,7 +333,12 @@ def run_sim_cuda(args):
                 steps_done = t + 1
                 break
 
-            should_draw = t % args.draw_interval == 0 or inter.mouse_down or inter.cut_pending
+            moving = False
+            if SO.vel.size:
+                motion_eps = max(float(args.sleep_eps), 1e-8)
+                speed2 = np.sum(SO.vel * SO.vel, axis=1)
+                moving = np.any(speed2 > motion_eps * motion_eps)
+            should_draw = t % args.draw_interval == 0 or inter.mouse_down or inter.cut_pending or moving
             if should_draw:
                 renderer.update(SO, inter.selected_idx)
                 inter.cut_pending = False
@@ -242,6 +366,7 @@ def main():
         help="FEM 计算设备（gpu 需要 CuPy）",
     )
     parser.add_argument("--damping", type=float, default=0.5)
+    parser.add_argument("--sleep-eps", type=float, default=0.0, help="速度睡眠阈值（<=0 关闭）")
     parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument("--ts", type=float, default=0.005)
     parser.add_argument("--steps", type=int, default=20000)
@@ -254,6 +379,18 @@ def main():
     )
     parser.add_argument("--draw-skip", type=int, default=1, help="绘制下采样（>1 时跳点/边）")
     parser.add_argument("--drag-k", type=float, default=5.0, help="鼠标拖拽虚拟弹簧系数")
+    parser.add_argument(
+        "--drag-sigma",
+        type=float,
+        default=None,
+        help="拖拽影响的高斯半径 sigma（世界单位，<=0 退化为单点拖拽）",
+    )
+    parser.add_argument(
+        "--drag-radius",
+        type=float,
+        default=None,
+        help="拖拽影响半径（世界单位，默认 3*sigma）",
+    )
     parser.add_argument("--pin-drag", action="store_true", help="拖拽时将节点直接钉在鼠标位置")
     parser.add_argument(
         "--texture",

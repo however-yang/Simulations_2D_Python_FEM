@@ -20,6 +20,7 @@ class SoftObject:
         fem_scale: float = 1.0,
         poisson: float = 0.3,
         fem_device: str = "cpu",
+        sleep_eps: float = 0.0,
     ):
         self.cols = int(cols)
         self.rows = int(rows)
@@ -28,16 +29,20 @@ class SoftObject:
         self.damping_map = np.full((self.rows, self.cols), float(damping), dtype=np.float64)
         self.fem_scale = max(0.0, float(fem_scale))
         self.poisson = float(np.clip(poisson, 0.0, 0.49))
-        self._init_state(pt_fixed_idx)
-        self._init_fem_mesh()
+        self.sleep_eps = max(0.0, float(sleep_eps))
         self._use_gpu = False
         self._cp = None
         self._tri_gpu = None
-        self._init_fem_backend(fem_device)
-        self.active = np.ones((self.rows, self.cols), dtype=bool)
+        self._force_ext_gpu = None
+        self._mesh_version = 0
+        self._node_grid_index = None
+        self._init_state(pt_fixed_idx)
+        self.active_grid = np.ones((self.rows, self.cols), dtype=bool)
         if active_mask is not None:
             self.set_active_mask(active_mask, rebuild=False)
-        self._init_conn_masks()
+        self._init_removed_cells()
+        self._rebuild_topology(preserve_state=False)
+        self._init_fem_backend(fem_device)
 
     # ------------------------------------------------------------------ 初始化
     def _init_state(self, pt_fixed_idx: Optional[np.ndarray]):
@@ -45,24 +50,16 @@ class SoftObject:
         c_grid = np.arange(self.cols, dtype=np.float64)
         C, R = np.meshgrid(c_grid, r_grid, indexing="xy")  # (rows, cols)
 
-        self.pos_init = np.zeros((self.rows, self.cols, 2), dtype=np.float64)
-        self.pos_init[..., 0] = C * self.edge_len
-        self.pos_init[..., 1] = R * self.edge_len
+        self.pos_init_grid = np.zeros((self.rows, self.cols, 2), dtype=np.float64)
+        self.pos_init_grid[..., 0] = C * self.edge_len
+        self.pos_init_grid[..., 1] = R * self.edge_len
 
-        self.pos = self.pos_init.copy()
-        self.pos_old = self.pos.copy()
-        self.vel = np.zeros_like(self.pos)
-        self.acc = np.zeros_like(self.pos)
-        self.v = np.zeros_like(self.pos)
-        self.force = np.zeros_like(self.pos)
-        self.force_ext = np.zeros_like(self.pos)
-
-        self.fixed_mode = np.zeros((self.rows, self.cols), dtype=bool)
+        self.fixed_grid = np.zeros((self.rows, self.cols), dtype=bool)
         if pt_fixed_idx is not None:
             idx = np.asarray(pt_fixed_idx, dtype=int) - 1  # 转为 0-based
             idx[:, 0] = np.clip(idx[:, 0], 0, self.rows - 1)
             idx[:, 1] = np.clip(idx[:, 1], 0, self.cols - 1)
-            self.fixed_mode[idx[:, 0], idx[:, 1]] = True
+            self.fixed_grid[idx[:, 0], idx[:, 1]] = True
 
         # 连接模式（与 MATLAB 保持一致，1~9 分别为九宫格边界/角落）
         conn = np.zeros((self.rows, self.cols), dtype=int)
@@ -88,30 +85,166 @@ class SoftObject:
                     conn[r, c] = 9
         self.conn_mode = conn
 
+    def _init_removed_cells(self):
+        cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
+        self.removed_cells = np.zeros(cell_shape, dtype=bool)
+        self.removed_cells_version = 0
+
+    def _rebuild_topology(self, preserve_state: bool = True):
+        cell_rows = max(self.rows - 1, 0)
+        cell_cols = max(self.cols - 1, 0)
+        cell_shape = (cell_rows, cell_cols)
+
+        cell_active = np.zeros(cell_shape, dtype=bool)
+        if cell_rows > 0 and cell_cols > 0:
+            cell_active[:, :] = True
+            if self.active_grid is not None:
+                active = self.active_grid
+                cell_active &= (
+                    active[:-1, :-1]
+                    & active[1:, :-1]
+                    & active[:-1, 1:]
+                    & active[1:, 1:]
+                )
+            if getattr(self, "removed_cells", None) is not None:
+                if self.removed_cells.shape != cell_shape:
+                    self.removed_cells = np.zeros(cell_shape, dtype=bool)
+                    self.removed_cells_version = 0
+                cell_active &= ~self.removed_cells
+        self.cell_active = cell_active
+
+        comp = -np.ones(cell_shape, dtype=int)
+        comp_id = 0
+        for r in range(cell_rows):
+            for c in range(cell_cols):
+                if not cell_active[r, c] or comp[r, c] >= 0:
+                    continue
+                stack = [(r, c)]
+                comp[r, c] = comp_id
+                while stack:
+                    rr, cc = stack.pop()
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr = rr + dr
+                        nc = cc + dc
+                        if nr < 0 or nr >= cell_rows or nc < 0 or nc >= cell_cols:
+                            continue
+                        if not cell_active[nr, nc] or comp[nr, nc] >= 0:
+                            continue
+                        comp[nr, nc] = comp_id
+                        stack.append((nr, nc))
+                comp_id += 1
+
+        node_map: Dict[Tuple[int, int], int] = {}
+        node_grid_index: List[int] = []
+        cell_nodes = np.full((cell_rows, cell_cols, 4), -1, dtype=int)
+
+        def grid_idx(rr: int, cc: int) -> int:
+            return rr * self.cols + cc
+
+        for r in range(cell_rows):
+            for c in range(cell_cols):
+                if not cell_active[r, c]:
+                    continue
+                cid = comp[r, c]
+                corners = [(r, c), (r + 1, c), (r, c + 1), (r + 1, c + 1)]
+                node_ids = []
+                for rr, cc in corners:
+                    g_idx = grid_idx(rr, cc)
+                    key = (cid, g_idx)
+                    if key not in node_map:
+                        node_map[key] = len(node_grid_index)
+                        node_grid_index.append(g_idx)
+                    node_ids.append(node_map[key])
+                cell_nodes[r, c] = node_ids
+
+        if cell_rows == 0 or cell_cols == 0:
+            node_grid_index = list(range(self.rows * self.cols))
+            cell_nodes = np.full((cell_rows, cell_cols, 4), -1, dtype=int)
+
+        node_grid_index_arr = np.asarray(node_grid_index, dtype=int)
+        node_count = int(node_grid_index_arr.size)
+        grid_count = self.rows * self.cols
+
+        pos_ref = self.pos_init_grid.reshape(-1, 2)
+        vel_ref = np.zeros_like(pos_ref)
+        if preserve_state and getattr(self, "node_grid_index", None) is not None and getattr(self, "pos", None) is not None:
+            old_grid = self.node_grid_index
+            if old_grid.size > 0:
+                counts = np.bincount(old_grid, minlength=grid_count).astype(np.float64)
+                pos_sum = np.zeros((grid_count, 2), dtype=np.float64)
+                np.add.at(pos_sum, old_grid, self.pos)
+                vel_sum = np.zeros((grid_count, 2), dtype=np.float64)
+                np.add.at(vel_sum, old_grid, self.vel)
+                valid = counts > 0
+                pos_ref = self.pos_init_grid.reshape(-1, 2).copy()
+                pos_ref[valid] = pos_sum[valid] / counts[valid, None]
+                vel_ref = np.zeros_like(pos_ref)
+                vel_ref[valid] = vel_sum[valid] / counts[valid, None]
+
+        self.node_grid_index = node_grid_index_arr
+        if node_count > 0:
+            self.pos_init = self.pos_init_grid.reshape(-1, 2)[self.node_grid_index].copy()
+            self.pos = pos_ref[self.node_grid_index].copy()
+            self.pos_old = self.pos.copy()
+            self.vel = vel_ref[self.node_grid_index].copy()
+            self.acc = np.zeros_like(self.pos)
+            self.v = np.zeros_like(self.pos)
+            self.force = np.zeros_like(self.pos)
+            self.force_ext = np.zeros_like(self.pos)
+            fixed_flat = self.fixed_grid.reshape(-1)
+            self.fixed_mode = fixed_flat[self.node_grid_index].copy()
+            self.active = np.ones(node_count, dtype=bool)
+            k_flat = self.k_map.reshape(-1)
+            self.k_nodes = k_flat[self.node_grid_index].copy()
+            damp_flat = self.damping_map.reshape(-1)
+            self.damping_nodes = damp_flat[self.node_grid_index].copy()
+        else:
+            self.pos_init = np.zeros((0, 2), dtype=np.float64)
+            self.pos = self.pos_init.copy()
+            self.pos_old = self.pos.copy()
+            self.vel = np.zeros_like(self.pos)
+            self.acc = np.zeros_like(self.pos)
+            self.v = np.zeros_like(self.pos)
+            self.force = np.zeros_like(self.pos)
+            self.force_ext = np.zeros_like(self.pos)
+            self.fixed_mode = np.zeros((0,), dtype=bool)
+            self.active = np.zeros((0,), dtype=bool)
+            self.k_nodes = np.zeros((0,), dtype=np.float64)
+            self.damping_nodes = np.zeros((0,), dtype=np.float64)
+
+        self.cell_nodes = cell_nodes
+        self._init_fem_mesh()
+        if self._use_gpu:
+            if self._cp is not None:
+                self._cp.cuda.Device().use()
+            self._tri_gpu = self._build_fem_gpu_buffers()
+            if self._cp is not None:
+                self._force_ext_gpu = self._cp.zeros(self.force_ext.shape, dtype=self._cp.float64)
+        self._mesh_version = int(getattr(self, "_mesh_version", 0)) + 1
+
     def _init_fem_mesh(self):
-        if self.rows < 2 or self.cols < 2:
+        if self.cell_nodes is None or self.rows < 2 or self.cols < 2:
             self._tri_indices = None
-            self._tri_cell_flat = None
             self._tri_inv_dm = None
             self._tri_ke = None
             self._tri_ke_x0 = None
             self._tri_x0 = None
             return
 
-        grid = np.arange(self.rows * self.cols, dtype=int).reshape(self.rows, self.cols)
-        v00 = grid[:-1, :-1]
-        v10 = grid[1:, :-1]
-        v01 = grid[:-1, 1:]
-        v11 = grid[1:, 1:]
-        tri1 = np.stack([v00, v10, v11], axis=2).reshape(-1, 3)
-        tri2 = np.stack([v00, v11, v01], axis=2).reshape(-1, 3)
-        self._tri_indices = np.vstack([tri1, tri2])
-
-        cell_r = np.repeat(np.arange(self.rows - 1), self.cols - 1)
-        cell_c = np.tile(np.arange(self.cols - 1), self.rows - 1)
-        cell_flat = cell_r * (self.cols - 1) + cell_c
-        self._tri_cell_flat = np.repeat(cell_flat, 2)
-
+        tris: List[List[int]] = []
+        for r in range(self.rows - 1):
+            for c in range(self.cols - 1):
+                if not self.cell_active[r, c]:
+                    continue
+                v00, v10, v01, v11 = self.cell_nodes[r, c]
+                if v00 < 0 or v10 < 0 or v01 < 0 or v11 < 0:
+                    continue
+                tris.append([v00, v10, v11])
+                tris.append([v00, v11, v01])
+        if tris:
+            self._tri_indices = np.asarray(tris, dtype=int)
+        else:
+            self._tri_indices = None
         self._build_fem_matrices()
 
     def _build_fem_matrices(self):
@@ -126,7 +259,14 @@ class SoftObject:
         idx1 = self._tri_indices[:, 1]
         idx2 = self._tri_indices[:, 2]
 
-        x0_all = self.pos_init.reshape(-1, 2)
+        if self.pos_init is None or self.pos_init.size == 0:
+            self._tri_inv_dm = None
+            self._tri_ke = None
+            self._tri_ke_x0 = None
+            self._tri_x0 = None
+            return
+
+        x0_all = self.pos_init
         x0 = np.stack([x0_all[idx0], x0_all[idx1], x0_all[idx2]], axis=1)
         self._tri_x0 = x0
 
@@ -153,7 +293,8 @@ class SoftObject:
         b[:, 2, 4] = grad2[:, 1]
         b[:, 2, 5] = grad2[:, 0]
 
-        k_nodes = self.k_map.reshape(-1)
+        k_grid = self.k_map.reshape(-1)
+        k_nodes = k_grid[self.node_grid_index]
         young = self.fem_scale * (k_nodes[idx0] + k_nodes[idx1] + k_nodes[idx2]) / 3.0
         # Map spring-like k to Young's modulus scale (stiffer for small edge length).
         young = young / max(self.edge_len, 1e-8)
@@ -183,7 +324,9 @@ class SoftObject:
                 ) from exc
             self._cp = cp
             self._use_gpu = True
+            self._cp.cuda.Device().use()
             self._tri_gpu = self._build_fem_gpu_buffers()
+            self._force_ext_gpu = cp.zeros(self.force_ext.shape, dtype=cp.float64)
         else:
             self._use_gpu = False
 
@@ -200,7 +343,6 @@ class SoftObject:
             "inv_dm": cp.asarray(self._tri_inv_dm, dtype=cp.float64),
             "ke": cp.asarray(self._tri_ke, dtype=cp.float64),
             "ke_x0": cp.asarray(self._tri_ke_x0, dtype=cp.float64),
-            "tri_cell_flat": cp.asarray(self._tri_cell_flat, dtype=cp.int32),
         }
         return tri_gpu
     def _init_conn_masks(self):
@@ -240,10 +382,10 @@ class SoftObject:
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != (self.rows, self.cols):
             raise ValueError("active_mask shape must match (rows, cols).")
-        self.active = mask
-        self.fixed_mode &= self.active
+        self.active_grid = mask
+        self.fixed_grid &= self.active_grid
         if rebuild:
-            self._init_conn_masks()
+            self._rebuild_topology(preserve_state=True)
 
     def _build_draw_edges(self):
         """预计算可绘制的线段（只保存右/上方向，避免重复）。"""
@@ -257,9 +399,9 @@ class SoftObject:
         for dr, dc in [(0, 1), (1, 0)]:
             neigh_mask = self._shift_with_mask(ones, dr, dc)[1]
             valid = self.offset_masks[(dr, dc)] & neigh_mask
-            if hasattr(self, "active"):
-                neigh_active, _ = self._shift_with_mask(self.active, dr, dc)
-                valid &= self.active & neigh_active
+            if self.active_grid is not None:
+                neigh_active, _ = self._shift_with_mask(self.active_grid, dr, dc)
+                valid &= self.active_grid & neigh_active
             if hasattr(self, "cut_masks"):
                 valid &= ~self.cut_masks[(dr, dc)]
             r_idx, c_idx = np.nonzero(valid)
@@ -334,7 +476,7 @@ class SoftObject:
         free_nodes = ~self.fixed_mode
         if hasattr(self, "active"):
             free_nodes &= self.active
-        free_dofs = np.repeat(free_nodes.ravel(), 2)
+        free_dofs = np.repeat(free_nodes, 2)
         if not np.any(free_dofs):
             return
 
@@ -356,18 +498,22 @@ class SoftObject:
         x_new_free = self._cg_solve(matvec, b_free, x_guess, max_iter=80, tol=1e-6)
         x_new = x.copy()
         x_new[free_dofs] = x_new_free
-        x_new = x_new.reshape(self.rows, self.cols, 2)
+        x_new = x_new.reshape(-1, 2)
 
         v_new = (x_new - self.pos) / ts
-        damp = 1.0 - self.damping_map * ts
+        damp = 1.0 - self.damping_nodes * ts
         damp = np.clip(damp, 0.0, 1.0)
-        v_new *= damp[..., None]
+        v_new *= damp[:, None]
 
         v_new[self.fixed_mode] = 0.0
         x_new[self.fixed_mode] = self.pos[self.fixed_mode]
         if hasattr(self, "active"):
             v_new[~self.active] = 0.0
             x_new[~self.active] = self.pos[~self.active]
+        if self.sleep_eps > 0.0:
+            sleep_eps2 = self.sleep_eps * self.sleep_eps
+            speed2 = v_new[:, 0] * v_new[:, 0] + v_new[:, 1] * v_new[:, 1]
+            v_new[speed2 < sleep_eps2] = 0.0
 
         vel_old = self.vel
         self.pos_old = self.pos
@@ -375,7 +521,7 @@ class SoftObject:
         self.vel = v_new
         self.v = self.pos - self.pos_old
         self.acc = (self.vel - vel_old) / ts
-        self.force = f_ext.reshape(self.rows, self.cols, 2)
+        self.force = f_ext.reshape(-1, 2)
 
     def _update_soft_object_gpu(self, mass: float, ts: float):
         if self._tri_gpu is None or ts <= 0:
@@ -385,7 +531,10 @@ class SoftObject:
 
         x = cp.asarray(self.pos, dtype=cp.float64).reshape(-1)
         v = cp.asarray(self.vel, dtype=cp.float64).reshape(-1)
-        f_ext = cp.asarray(self.force_ext, dtype=cp.float64).reshape(-1)
+        if self._force_ext_gpu is None:
+            f_ext = cp.asarray(self.force_ext, dtype=cp.float64).reshape(-1)
+        else:
+            f_ext = self._force_ext_gpu.reshape(-1)
 
         rot, tri_active = self._compute_fem_rotation_gpu(x)
         f0 = self._compute_f0_gpu(rot, tri_active)
@@ -396,7 +545,7 @@ class SoftObject:
         free_nodes = ~self.fixed_mode
         if hasattr(self, "active"):
             free_nodes &= self.active
-        free_dofs = np.repeat(free_nodes.ravel(), 2)
+        free_dofs = np.repeat(free_nodes, 2)
         if not np.any(free_dofs):
             return
         free_dofs_gpu = cp.asarray(free_dofs)
@@ -419,12 +568,12 @@ class SoftObject:
         x_new_free = self._cg_solve_gpu(matvec, b_free, x_guess, max_iter=80, tol=1e-6)
         x_new = x.copy()
         x_new[free_dofs_gpu] = x_new_free
-        x_new = x_new.reshape(self.rows, self.cols, 2)
+        x_new = x_new.reshape(-1, 2)
 
         v_new = (x_new - cp.asarray(self.pos)) / ts
-        damp = 1.0 - cp.asarray(self.damping_map) * ts
+        damp = 1.0 - cp.asarray(self.damping_nodes) * ts
         damp = cp.clip(damp, 0.0, 1.0)
-        v_new *= damp[..., None]
+        v_new *= damp[:, None]
 
         v_new = cp.where(cp.asarray(self.fixed_mode)[..., None], 0.0, v_new)
         x_new = cp.where(cp.asarray(self.fixed_mode)[..., None], cp.asarray(self.pos), x_new)
@@ -432,6 +581,10 @@ class SoftObject:
             active = cp.asarray(self.active)
             v_new = cp.where(active[..., None], v_new, 0.0)
             x_new = cp.where(active[..., None], x_new, cp.asarray(self.pos))
+        if self.sleep_eps > 0.0:
+            sleep_eps2 = self.sleep_eps * self.sleep_eps
+            speed2 = cp.sum(v_new * v_new, axis=1)
+            v_new[speed2 < sleep_eps2] = 0.0
 
         vel_old = self.vel
         self.pos_old = self.pos
@@ -439,7 +592,7 @@ class SoftObject:
         self.vel = cp.asnumpy(v_new)
         self.v = self.pos - self.pos_old
         self.acc = (self.vel - vel_old) / ts
-        self.force = cp.asnumpy(f_ext).reshape(self.rows, self.cols, 2)
+        self.force = cp.asnumpy(f_ext).reshape(-1, 2)
 
     # ------------------------------------------------------------------ FEM
     def _compute_fem_rotation(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -461,16 +614,7 @@ class SoftObject:
             u[flip, :, -1] *= -1.0
             r = np.einsum("tij,tjk->tik", u, vt)
 
-        tri_active = None
-        if self.rows > 1 and self.cols > 1:
-            cell_mask = np.ones((self.rows - 1, self.cols - 1), dtype=bool)
-            if hasattr(self, "active"):
-                active = self.active
-                cell_mask &= active[:-1, :-1] & active[:-1, 1:] & active[1:, :-1] & active[1:, 1:]
-            if hasattr(self, "removed_cells"):
-                cell_mask &= ~self.removed_cells
-            tri_active = cell_mask.reshape(-1)[self._tri_cell_flat]
-        return r, tri_active
+        return r, None
 
     def _compute_fem_rotation_gpu(self, x_flat: "cp.ndarray") -> Tuple["cp.ndarray", Optional["cp.ndarray"]]:
         cp = self._cp
@@ -499,16 +643,7 @@ class SoftObject:
         r[:, 1, 0] = r10 / s
         r[:, 1, 1] = r11 / s
 
-        tri_active = None
-        if self.rows > 1 and self.cols > 1:
-            cell_mask = np.ones((self.rows - 1, self.cols - 1), dtype=bool)
-            if hasattr(self, "active"):
-                active = self.active
-                cell_mask &= active[:-1, :-1] & active[:-1, 1:] & active[1:, :-1] & active[1:, 1:]
-            if hasattr(self, "removed_cells"):
-                cell_mask &= ~self.removed_cells
-            tri_active = cp.asarray(cell_mask.reshape(-1)[self._tri_cell_flat], dtype=cp.bool_)
-        return r, tri_active
+        return r, None
 
     def _rotate_vec(self, rot: np.ndarray, vec: np.ndarray, transpose: bool = False) -> np.ndarray:
         vec2 = vec.reshape(-1, 3, 2)
@@ -533,7 +668,7 @@ class SoftObject:
         idx0 = self._tri_indices[:, 0]
         idx1 = self._tri_indices[:, 1]
         idx2 = self._tri_indices[:, 2]
-        out = np.zeros((self.rows * self.cols, 2), dtype=np.float64)
+        out = np.zeros((self.pos.shape[0], 2), dtype=np.float64)
         np.add.at(out, idx0, tri_vec[:, 0:2])
         np.add.at(out, idx1, tri_vec[:, 2:4])
         np.add.at(out, idx2, tri_vec[:, 4:6])
@@ -544,7 +679,7 @@ class SoftObject:
         idx0 = self._tri_gpu["idx0"]
         idx1 = self._tri_gpu["idx1"]
         idx2 = self._tri_gpu["idx2"]
-        out = cp.zeros((self.rows * self.cols, 2), dtype=cp.float64)
+        out = cp.zeros((self.pos.shape[0], 2), dtype=cp.float64)
         cp.add.at(out, idx0, tri_vec[:, 0:2])
         cp.add.at(out, idx1, tri_vec[:, 2:4])
         cp.add.at(out, idx2, tri_vec[:, 4:6])
@@ -652,52 +787,51 @@ class SoftObject:
         cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
         if not hasattr(self, "removed_cells") or self.removed_cells.shape != cell_shape:
             self.removed_cells = np.zeros(cell_shape, dtype=bool)
-            self._rebuild_cut_masks_from_removed_cells()
+            self.removed_cells_version = 0
 
-        centers = (
-            self.pos[:-1, :-1]
-            + self.pos[1:, :-1]
-            + self.pos[:-1, 1:]
-            + self.pos[1:, 1:]
-        ) * 0.25
+        if self.cell_nodes is None or self.cell_nodes.size == 0:
+            return False
+
         valid = np.ones(cell_shape, dtype=bool)
-        if hasattr(self, "active"):
-            active = self.active
+        if self.active_grid is not None:
+            active = self.active_grid
             valid &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
         valid &= ~self.removed_cells
         if not np.any(valid):
             return False
 
+        flat_valid = np.flatnonzero(valid.reshape(-1))
+        nodes = self.cell_nodes.reshape(-1, 4)[flat_valid]
+        centers = self.pos[nodes].mean(axis=1)
         target = np.array([x, y], dtype=np.float64)
         diff = centers - target
-        dist2 = (diff * diff).sum(axis=2)
-        dist2 = np.where(valid, dist2, np.inf)
-        flat_idx = int(np.argmin(dist2))
-        best_dist2 = float(dist2.ravel()[flat_idx])
+        dist2 = (diff * diff).sum(axis=1)
+        best_idx = int(np.argmin(dist2))
+        best_dist2 = float(dist2[best_idx])
         if not np.isfinite(best_dist2):
             return False
         if max_dist is not None and best_dist2 > max_dist * max_dist:
             return False
 
-        r = int(flat_idx // (self.cols - 1))
-        c = int(flat_idx % (self.cols - 1))
+        flat_cell = int(flat_valid[best_idx])
+        r = int(flat_cell // (self.cols - 1))
+        c = int(flat_cell % (self.cols - 1))
         self.removed_cells[r, c] = True
         self.removed_cells_version = int(getattr(self, "removed_cells_version", 0)) + 1
-        self._rebuild_cut_masks_from_removed_cells()
+        self._rebuild_topology(preserve_state=True)
         return True
 
     def get_cut_cell_mask(self) -> Optional[np.ndarray]:
         if self.rows < 2 or self.cols < 2:
             return None
         mask = np.ones((self.rows - 1, self.cols - 1), dtype=bool)
-        if hasattr(self, "active"):
-            active = self.active
+        if self.active_grid is not None:
+            active = self.active_grid
             mask &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
         if hasattr(self, "removed_cells"):
             if self.removed_cells.shape != mask.shape:
                 self.removed_cells = np.zeros(mask.shape, dtype=bool)
                 self.removed_cells_version = 0
-                self._rebuild_cut_masks_from_removed_cells()
             mask &= ~self.removed_cells
         return mask
 
@@ -724,69 +858,85 @@ class SoftObject:
 
     # ------------------------------------------------------------------ 绘图辅助
     def drawSoftObject(self) -> np.ndarray:
-        """返回用于 Matplotlib Line2D 的 (N,2) 坐标，使用 NaN 分段。"""
-        if not self._draw_edges:
+        if self.cell_nodes is None or self.cell_nodes.size == 0:
             return np.zeros((0, 2), dtype=np.float64)
-
-        start_idx, end_idx = self._draw_edges
-        pos_flat = self.pos.reshape(-1, 2)
-        start = pos_flat[start_idx]
-        end = pos_flat[end_idx]
-
-        nan_sep = np.full_like(start, np.nan)
-        seg = np.stack([start, end, nan_sep], axis=1)
-        return seg.reshape(-1, 2)
+        edges = set()
+        for r in range(self.rows - 1):
+            for c in range(self.cols - 1):
+                if not self.cell_active[r, c]:
+                    continue
+                v00, v10, v01, v11 = self.cell_nodes[r, c]
+                for a, b in [(v00, v10), (v10, v11), (v11, v01), (v01, v00)]:
+                    if a < 0 or b < 0:
+                        continue
+                    edge = (a, b) if a < b else (b, a)
+                    edges.add(edge)
+        if not edges:
+            return np.zeros((0, 2), dtype=np.float64)
+        coords = np.zeros((len(edges) * 2, 2), dtype=np.float64)
+        for i, (a, b) in enumerate(edges):
+            coords[i * 2] = self.pos[a]
+            coords[i * 2 + 1] = self.pos[b]
+        return coords
 
     def drawSoftObjectContour(self) -> np.ndarray:
-        if hasattr(self, "active") and not np.all(self.active):
-            return self.drawSoftObject()
-        max_points = (self.cols + self.rows) * 2
-        canvas = np.zeros((max_points, 2), dtype=np.float64)
-        idx = 0
-        for c in range(self.cols):
-            canvas[idx] = self.pos[0, c]
-            idx += 1
-        for r in range(self.rows):
-            canvas[idx] = self.pos[r, self.cols - 1]
-            idx += 1
-        for c in range(self.cols - 1, -1, -1):
-            canvas[idx] = self.pos[self.rows - 1, c]
-            idx += 1
-        for r in range(self.rows - 1, -1, -1):
-            canvas[idx] = self.pos[r, 0]
-            idx += 1
-        return canvas[:idx]
+        if self.cell_nodes is None or self.cell_nodes.size == 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        edge_count: Dict[Tuple[int, int], int] = {}
+        for r in range(self.rows - 1):
+            for c in range(self.cols - 1):
+                if not self.cell_active[r, c]:
+                    continue
+                v00, v10, v01, v11 = self.cell_nodes[r, c]
+                for a, b in [(v00, v10), (v10, v11), (v11, v01), (v01, v00)]:
+                    if a < 0 or b < 0:
+                        continue
+                    edge = (a, b) if a < b else (b, a)
+                    edge_count[edge] = edge_count.get(edge, 0) + 1
+        boundary = [edge for edge, count in edge_count.items() if count == 1]
+        if not boundary:
+            return np.zeros((0, 2), dtype=np.float64)
+        coords = np.zeros((len(boundary) * 2, 2), dtype=np.float64)
+        for i, (a, b) in enumerate(boundary):
+            coords[i * 2] = self.pos[a]
+            coords[i * 2 + 1] = self.pos[b]
+        return coords
 
     def drawSoftObjectPt(self) -> np.ndarray:
         if hasattr(self, "active"):
             return self.pos[self.active]
         return self.pos.reshape(-1, 2)
 
-    def find_closest_node(self, x: float, y: float) -> Tuple[int, int]:
+    def find_closest_node(self, x: float, y: float) -> int:
+        if self.pos.size == 0:
+            return -1
         target = np.array([x, y], dtype=np.float64)
         diff = self.pos - target
-        dist2 = (diff * diff).sum(axis=2)
+        dist2 = (diff * diff).sum(axis=1)
         if hasattr(self, "active"):
             if not np.any(self.active):
-                return -1, -1
+                return -1
             dist2 = np.where(self.active, dist2, np.inf)
-        flat_idx = np.argmin(dist2)
-        r = int(flat_idx // self.cols)
-        c = int(flat_idx % self.cols)
-        return r, c
+        flat_idx = int(np.argmin(dist2))
+        if not np.isfinite(dist2[flat_idx]):
+            return -1
+        return flat_idx
 
-    def toggle_fixed(self, r: int, c: int, force: Optional[bool] = None) -> bool:
-        if r < 0 or r >= self.rows or c < 0 or c >= self.cols:
+    def toggle_fixed(self, node_idx: int, force: Optional[bool] = None) -> bool:
+        if node_idx < 0 or node_idx >= self.pos.shape[0]:
             return False
-        if hasattr(self, "active") and not self.active[r, c]:
-            return False
+        grid_idx = int(self.node_grid_index[node_idx])
+        r = int(grid_idx // self.cols)
+        c = int(grid_idx % self.cols)
         if force is None:
-            new_state = not self.fixed_mode[r, c]
+            new_state = not self.fixed_grid[r, c]
         else:
             new_state = bool(force)
-        if new_state == self.fixed_mode[r, c]:
+        if new_state == self.fixed_grid[r, c]:
             return False
-        self.fixed_mode[r, c] = new_state
+        self.fixed_grid[r, c] = new_state
+        mask = self.node_grid_index == grid_idx
+        self.fixed_mode[mask] = new_state
         if new_state:
             # Freeze current configuration to avoid sudden constraint shocks.
             self.pos_old = self.pos.copy()
@@ -794,29 +944,40 @@ class SoftObject:
             self.acc.fill(0.0)
             self.v.fill(0.0)
             self.force_ext.fill(0.0)
-            self.pos_old[r, c] = self.pos[r, c]
-            self.vel[r, c, :] = 0.0
-            self.acc[r, c, :] = 0.0
-            self.force_ext[r, c, :] = 0.0
+            if self._use_gpu and self._force_ext_gpu is not None:
+                self._force_ext_gpu.fill(0.0)
+            self.pos_old[mask] = self.pos[mask]
+            self.vel[mask] = 0.0
+            self.acc[mask] = 0.0
+            self.force_ext[mask] = 0.0
         return True
 
     def toggle_fixed_nearest(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
-        r, c = self.find_closest_node(x, y)
-        if r < 0 or c < 0:
+        idx = self.find_closest_node(x, y)
+        if idx < 0:
             return False
         if max_dist is not None:
-            dist = float(np.linalg.norm(self.pos[r, c] - np.array([x, y], dtype=np.float64)))
+            dist = float(np.linalg.norm(self.pos[idx] - np.array([x, y], dtype=np.float64)))
             if dist > max_dist:
                 return False
-        return self.toggle_fixed(r, c)
+        return self.toggle_fixed(idx)
 
     # ------------------------------------------------------------------ 辅助接口
-    def set_force_ext(self, r: int, c: int, fx: float, fy: float):
-        self.force_ext[r, c, 0] = fx
-        self.force_ext[r, c, 1] = fy
+    def set_force_ext(self, node_idx: int, fx: float, fy: float):
+        if node_idx < 0 or node_idx >= self.pos.shape[0]:
+            return
+        self.force_ext[node_idx, 0] = fx
+        self.force_ext[node_idx, 1] = fy
+        if self._use_gpu and self._force_ext_gpu is not None:
+            self._force_ext_gpu[node_idx, 0] = fx
+            self._force_ext_gpu[node_idx, 1] = fy
 
-    def clear_force_ext(self, r: int, c: int):
-        self.force_ext[r, c, :] = 0.0
+    def clear_force_ext(self, node_idx: int):
+        if node_idx < 0 or node_idx >= self.pos.shape[0]:
+            return
+        self.force_ext[node_idx, :] = 0.0
+        if self._use_gpu and self._force_ext_gpu is not None:
+            self._force_ext_gpu[node_idx, :] = 0.0
 
     def set_conn_mode(self, r: int, c: int, mode: int):
         self.conn_mode[r, c] = mode
