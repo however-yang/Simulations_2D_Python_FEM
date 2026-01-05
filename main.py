@@ -272,6 +272,8 @@ def run_sim_cuda(args):
         poisson=args.poisson,
         fem_device=args.fem_device,
         sleep_eps=args.sleep_eps,
+        pin_sigma=args.fixed_sigma,
+        pin_radius=args.fixed_radius,
     )
 
     use_texture = args.texture is not None or args.draw_mode == "texture"
@@ -301,6 +303,7 @@ def run_sim_cuda(args):
         active_mask=active_mask,
     )
     inter = CUDAGLInteractor(renderer, SO, renderer.bounds)
+    inter.cut_radius = float(args.cut_radius) if args.cut_radius is not None else 0.0
 
     drag_sigma = args.drag_sigma
     if drag_sigma is None:
@@ -353,8 +356,8 @@ def run_sim_cuda(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=200)
-    parser.add_argument("--cols", type=int, default=200)
+    parser.add_argument("--rows", type=int, default=500)
+    parser.add_argument("--cols", type=int, default=500)
     parser.add_argument("--edge-len", type=float, default=0.02)
     parser.add_argument("--k", type=float, default=10.0)
     parser.add_argument("--fem-scale", type=float, default=5.0, help="FEM 刚度缩放（乘到 k）")
@@ -392,6 +395,14 @@ def main():
         help="拖拽影响半径（世界单位，默认 3*sigma）",
     )
     parser.add_argument("--pin-drag", action="store_true", help="拖拽时将节点直接钉在鼠标位置")
+    parser.add_argument("--fixed-sigma", type=float, default=None, help="固定点高斯半径 sigma（世界单位）")
+    parser.add_argument(
+        "--fixed-radius",
+        type=float,
+        default=None,
+        help="固定点高斯作用半径（默认 3*sigma）",
+    )
+    parser.add_argument("--cut-radius", type=float, default=None, help="切割半径（世界单位，0 表示单格切割）")
     parser.add_argument(
         "--texture",
         nargs="?",

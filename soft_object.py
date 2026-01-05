@@ -21,6 +21,8 @@ class SoftObject:
         poisson: float = 0.3,
         fem_device: str = "cpu",
         sleep_eps: float = 0.0,
+        pin_sigma: Optional[float] = None,
+        pin_radius: Optional[float] = None,
     ):
         self.cols = int(cols)
         self.rows = int(rows)
@@ -30,11 +32,19 @@ class SoftObject:
         self.fem_scale = max(0.0, float(fem_scale))
         self.poisson = float(np.clip(poisson, 0.0, 0.49))
         self.sleep_eps = max(0.0, float(sleep_eps))
+        if pin_sigma is None:
+            pin_sigma = self.edge_len * 4.0
+        self.pin_sigma = max(0.0, float(pin_sigma))
+        if pin_radius is None:
+            pin_radius = self.pin_sigma * 3.0
+        self.pin_radius = max(0.0, float(pin_radius))
+        self.pin_strength = max(1.0, self.fem_scale)
         self._use_gpu = False
         self._cp = None
         self._tri_gpu = None
         self._force_ext_gpu = None
         self._mesh_version = 0
+        self._pending_rebuild = False
         self._node_grid_index = None
         self._init_state(pt_fixed_idx)
         self.active_grid = np.ones((self.rows, self.cols), dtype=bool)
@@ -43,6 +53,7 @@ class SoftObject:
         self._init_removed_cells()
         self._rebuild_topology(preserve_state=False)
         self._init_fem_backend(fem_device)
+        self._update_pin_from_fixed_grid()
 
     # ------------------------------------------------------------------ 初始化
     def _init_state(self, pt_fixed_idx: Optional[np.ndarray]):
@@ -53,6 +64,9 @@ class SoftObject:
         self.pos_init_grid = np.zeros((self.rows, self.cols, 2), dtype=np.float64)
         self.pos_init_grid[..., 0] = C * self.edge_len
         self.pos_init_grid[..., 1] = R * self.edge_len
+
+        self.pin_weight_grid = np.zeros((self.rows, self.cols), dtype=np.float64)
+        self.pin_target_grid = self.pos_init_grid.copy()
 
         self.fixed_grid = np.zeros((self.rows, self.cols), dtype=bool)
         if pt_fixed_idx is not None:
@@ -212,6 +226,7 @@ class SoftObject:
             self.k_nodes = np.zeros((0,), dtype=np.float64)
             self.damping_nodes = np.zeros((0,), dtype=np.float64)
 
+        self._sync_pin_nodes()
         self.cell_nodes = cell_nodes
         self._init_fem_mesh()
         if self._use_gpu:
@@ -221,6 +236,67 @@ class SoftObject:
             if self._cp is not None:
                 self._force_ext_gpu = self._cp.zeros(self.force_ext.shape, dtype=self._cp.float64)
         self._mesh_version = int(getattr(self, "_mesh_version", 0)) + 1
+
+    def _ensure_pin_grids(self):
+        if not hasattr(self, "pin_weight_grid") or self.pin_weight_grid.shape != (self.rows, self.cols):
+            self.pin_weight_grid = np.zeros((self.rows, self.cols), dtype=np.float64)
+        if not hasattr(self, "pin_target_grid") or self.pin_target_grid.shape != (self.rows, self.cols, 2):
+            self.pin_target_grid = self.pos_init_grid.copy()
+
+    def _grid_positions_from_nodes(self) -> np.ndarray:
+        grid_count = self.rows * self.cols
+        pos_grid = self.pos_init_grid.reshape(-1, 2).copy()
+        if self.node_grid_index is None or self.node_grid_index.size == 0:
+            return pos_grid.reshape(self.rows, self.cols, 2)
+        counts = np.bincount(self.node_grid_index, minlength=grid_count).astype(np.float64)
+        pos_sum = np.zeros((grid_count, 2), dtype=np.float64)
+        np.add.at(pos_sum, self.node_grid_index, self.pos)
+        valid = counts > 0
+        pos_grid[valid] = pos_sum[valid] / counts[valid, None]
+        return pos_grid.reshape(self.rows, self.cols, 2)
+
+    def _compute_pin_weight_grid(self) -> np.ndarray:
+        if self.pin_sigma <= 0.0:
+            return np.zeros((self.rows, self.cols), dtype=np.float64)
+        centers = np.argwhere(self.fixed_grid)
+        if centers.size == 0:
+            return np.zeros((self.rows, self.cols), dtype=np.float64)
+        sigma2 = self.pin_sigma * self.pin_sigma
+        radius2 = self.pin_radius * self.pin_radius if self.pin_radius > 0.0 else None
+        grid_pos = self.pos_init_grid
+        weights = np.zeros((self.rows, self.cols), dtype=np.float64)
+        for r, c in centers:
+            center = grid_pos[r, c]
+            diff = grid_pos - center
+            dist2 = diff[..., 0] * diff[..., 0] + diff[..., 1] * diff[..., 1]
+            w = np.exp(-0.5 * dist2 / sigma2)
+            if radius2 is not None:
+                w = np.where(dist2 <= radius2, w, 0.0)
+            weights = np.maximum(weights, w)
+        if self.active_grid is not None:
+            weights *= self.active_grid
+        return weights
+
+    def _sync_pin_nodes(self):
+        self._ensure_pin_grids()
+        if self.node_grid_index is None or self.node_grid_index.size == 0:
+            self.pin_weight = np.zeros((0,), dtype=np.float64)
+            self.pin_target = np.zeros((0, 2), dtype=np.float64)
+            return
+        pin_weight_flat = self.pin_weight_grid.reshape(-1)
+        self.pin_weight = pin_weight_flat[self.node_grid_index].copy()
+        pin_target_flat = self.pin_target_grid.reshape(-1, 2)
+        self.pin_target = pin_target_flat[self.node_grid_index].copy()
+
+    def _update_pin_from_fixed_grid(self):
+        self._ensure_pin_grids()
+        prev_weight = self.pin_weight_grid.copy()
+        self.pin_weight_grid = self._compute_pin_weight_grid()
+        increased = self.pin_weight_grid > prev_weight
+        if np.any(increased):
+            pos_grid = self._grid_positions_from_nodes()
+            self.pin_target_grid[increased] = pos_grid[increased]
+        self._sync_pin_nodes()
 
     def _init_fem_mesh(self):
         if self.cell_nodes is None or self.rows < 2 or self.cols < 2:
@@ -386,6 +462,8 @@ class SoftObject:
         self.fixed_grid &= self.active_grid
         if rebuild:
             self._rebuild_topology(preserve_state=True)
+        if getattr(self, "node_grid_index", None) is not None:
+            self._update_pin_from_fixed_grid()
 
     def _build_draw_edges(self):
         """预计算可绘制的线段（只保存右/上方向，避免重复）。"""
@@ -473,6 +551,23 @@ class SoftObject:
         dt2 = ts * ts
         b = mass * (x + ts * v) + dt2 * (f_ext + f0)
 
+        pin_dofs = None
+        pin_weight = getattr(self, "pin_weight", None)
+        pin_target = getattr(self, "pin_target", None)
+        if pin_weight is not None and pin_target is not None:
+            if pin_weight.shape[0] == self.pos.shape[0] and pin_target.shape == self.pos.shape:
+                if np.any(pin_weight > 0):
+                    pin_weight_eff = pin_weight
+                    if hasattr(self, "active"):
+                        pin_weight_eff = np.where(self.active, pin_weight_eff, 0.0)
+                    if self.fixed_mode.size:
+                        pin_weight_eff = np.where(self.fixed_mode, 0.0, pin_weight_eff)
+                    if np.any(pin_weight_eff > 0):
+                        pin_k = self.k_nodes * self.pin_strength
+                        pin_k = pin_k * pin_weight_eff
+                        pin_dofs = np.repeat(pin_k, 2)
+                        b += dt2 * pin_dofs * pin_target.reshape(-1)
+
         free_nodes = ~self.fixed_mode
         if hasattr(self, "active"):
             free_nodes &= self.active
@@ -493,6 +588,8 @@ class SoftObject:
             p_full[free_dofs] = p_free
             y_full = mass * p_full
             y_full += dt2 * self._apply_k_rot(p_full, rot, tri_active)
+            if pin_dofs is not None:
+                y_full += dt2 * pin_dofs * p_full
             return y_full[free_dofs]
 
         x_new_free = self._cg_solve(matvec, b_free, x_guess, max_iter=80, tol=1e-6)
@@ -542,6 +639,22 @@ class SoftObject:
         dt2 = ts * ts
         b = mass * (x + ts * v) + dt2 * (f_ext + f0)
 
+        pin_dofs = None
+        pin_weight = getattr(self, "pin_weight", None)
+        pin_target = getattr(self, "pin_target", None)
+        if pin_weight is not None and pin_target is not None:
+            if pin_weight.shape[0] == self.pos.shape[0] and pin_target.shape == self.pos.shape:
+                if np.any(pin_weight > 0):
+                    pin_weight_gpu = cp.asarray(pin_weight, dtype=cp.float64)
+                    if hasattr(self, "active"):
+                        pin_weight_gpu = cp.where(cp.asarray(self.active), pin_weight_gpu, 0.0)
+                    pin_weight_gpu = cp.where(cp.asarray(self.fixed_mode), 0.0, pin_weight_gpu)
+                    pin_k = cp.asarray(self.k_nodes, dtype=cp.float64) * self.pin_strength
+                    pin_k = pin_k * pin_weight_gpu
+                    pin_dofs = cp.repeat(pin_k, 2)
+                    x_pin = cp.asarray(pin_target, dtype=cp.float64).reshape(-1)
+                    b += dt2 * pin_dofs * x_pin
+
         free_nodes = ~self.fixed_mode
         if hasattr(self, "active"):
             free_nodes &= self.active
@@ -563,6 +676,8 @@ class SoftObject:
             p_full[free_dofs_gpu] = p_free
             y_full = mass * p_full
             y_full += dt2 * self._apply_k_rot_gpu(p_full, rot, tri_active)
+            if pin_dofs is not None:
+                y_full += dt2 * pin_dofs * p_full
             return y_full[free_dofs_gpu]
 
         x_new_free = self._cg_solve_gpu(matvec, b_free, x_guess, max_iter=80, tol=1e-6)
@@ -781,7 +896,118 @@ class SoftObject:
             rr = rr_new
         return x
 
-    def remove_nearest_cell(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:
+    def _finalize_cut(self, rebuild: bool):
+        if rebuild:
+            self._rebuild_topology(preserve_state=True)
+            self._pending_rebuild = False
+        else:
+            self._pending_rebuild = True
+
+    def commit_cuts(self) -> bool:
+        if not getattr(self, "_pending_rebuild", False):
+            return False
+        self._rebuild_topology(preserve_state=True)
+        self._pending_rebuild = False
+        return True
+
+    def remove_cells_near(self, x: float, y: float, radius: float, rebuild: bool = True) -> bool:
+        if radius is None or radius <= 0.0:
+            return self.remove_nearest_cell(x, y, rebuild=rebuild)
+        if self.rows < 2 or self.cols < 2:
+            return False
+        cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
+        if not hasattr(self, "removed_cells") or self.removed_cells.shape != cell_shape:
+            self.removed_cells = np.zeros(cell_shape, dtype=bool)
+            self.removed_cells_version = 0
+
+        if self.cell_nodes is None or self.cell_nodes.size == 0:
+            return False
+
+        valid = np.ones(cell_shape, dtype=bool)
+        if self.active_grid is not None:
+            active = self.active_grid
+            valid &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
+        valid &= ~self.removed_cells
+        if not np.any(valid):
+            return False
+
+        flat_valid = np.flatnonzero(valid.reshape(-1))
+        nodes = self.cell_nodes.reshape(-1, 4)[flat_valid]
+        centers = self.pos[nodes].mean(axis=1)
+        target = np.array([x, y], dtype=np.float64)
+        diff = centers - target
+        dist2 = (diff * diff).sum(axis=1)
+        radius2 = float(radius) * float(radius)
+        hit = dist2 <= radius2
+        if not np.any(hit):
+            return False
+        flat_cells = flat_valid[hit]
+        r = (flat_cells // (self.cols - 1)).astype(int)
+        c = (flat_cells % (self.cols - 1)).astype(int)
+        self.removed_cells[r, c] = True
+        self.removed_cells_version = int(getattr(self, "removed_cells_version", 0)) + 1
+        self._finalize_cut(rebuild)
+        return True
+
+    def remove_cells_along_segment(
+        self, x0: float, y0: float, x1: float, y1: float, radius: float, rebuild: bool = True
+    ) -> bool:
+        if radius is None or radius <= 0.0:
+            return self.remove_nearest_cell(x1, y1, rebuild=rebuild)
+        if self.rows < 2 or self.cols < 2:
+            return False
+        cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
+        if not hasattr(self, "removed_cells") or self.removed_cells.shape != cell_shape:
+            self.removed_cells = np.zeros(cell_shape, dtype=bool)
+            self.removed_cells_version = 0
+
+        if self.cell_nodes is None or self.cell_nodes.size == 0:
+            return False
+
+        valid = np.ones(cell_shape, dtype=bool)
+        if self.active_grid is not None:
+            active = self.active_grid
+            valid &= active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:] & active[1:, 1:]
+        valid &= ~self.removed_cells
+        if not np.any(valid):
+            return False
+
+        flat_valid = np.flatnonzero(valid.reshape(-1))
+        nodes = self.cell_nodes.reshape(-1, 4)[flat_valid]
+        centers = self.pos[nodes].mean(axis=1)
+        ax = float(x0)
+        ay = float(y0)
+        bx = float(x1)
+        by = float(y1)
+        vx = bx - ax
+        vy = by - ay
+        seg_len2 = vx * vx + vy * vy
+        if seg_len2 < 1e-12:
+            return self.remove_cells_near(ax, ay, radius, rebuild=rebuild)
+        px = centers[:, 0] - ax
+        py = centers[:, 1] - ay
+        t = (px * vx + py * vy) / seg_len2
+        t = np.clip(t, 0.0, 1.0)
+        cx = ax + t * vx
+        cy = ay + t * vy
+        dx = centers[:, 0] - cx
+        dy = centers[:, 1] - cy
+        dist2 = dx * dx + dy * dy
+        radius2 = float(radius) * float(radius)
+        hit = dist2 <= radius2
+        if not np.any(hit):
+            return False
+        flat_cells = flat_valid[hit]
+        r = (flat_cells // (self.cols - 1)).astype(int)
+        c = (flat_cells % (self.cols - 1)).astype(int)
+        self.removed_cells[r, c] = True
+        self.removed_cells_version = int(getattr(self, "removed_cells_version", 0)) + 1
+        self._finalize_cut(rebuild)
+        return True
+
+    def remove_nearest_cell(
+        self, x: float, y: float, max_dist: Optional[float] = None, rebuild: bool = True
+    ) -> bool:
         if self.rows < 2 or self.cols < 2:
             return False
         cell_shape = (max(self.rows - 1, 0), max(self.cols - 1, 0))
@@ -818,7 +1044,7 @@ class SoftObject:
         c = int(flat_cell % (self.cols - 1))
         self.removed_cells[r, c] = True
         self.removed_cells_version = int(getattr(self, "removed_cells_version", 0)) + 1
-        self._rebuild_topology(preserve_state=True)
+        self._finalize_cut(rebuild)
         return True
 
     def get_cut_cell_mask(self) -> Optional[np.ndarray]:
@@ -950,6 +1176,7 @@ class SoftObject:
             self.vel[mask] = 0.0
             self.acc[mask] = 0.0
             self.force_ext[mask] = 0.0
+        self._update_pin_from_fixed_grid()
         return True
 
     def toggle_fixed_nearest(self, x: float, y: float, max_dist: Optional[float] = None) -> bool:

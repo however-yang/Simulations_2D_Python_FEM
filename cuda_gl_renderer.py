@@ -4,9 +4,10 @@ Requires: pip install pycuda PyOpenGL glfw
 Notes:
 - Must be created after a CUDA-capable device is available.
 - Supports draw_mode 'points', 'contour', or 'texture' (textured mesh).
-- Interaction: left-click selects nearest node; drag to move cursor; press 'f' to toggle fixed; right-click cuts; 'q' closes window.
+- Interaction: left-click selects nearest node; drag to move cursor; press 'f' to toggle fixed; right-click cuts; press 'c' to toggle continuous cutting; 'q' closes window.
 """
 from typing import Optional, Tuple
+import time
 import numpy as np
 from OpenGL import GL
 import glfw
@@ -18,6 +19,14 @@ class CUDAGLInteractor:
         self.so = so
         self.mouse_down = False
         self.space_down = False
+        self.right_down = False
+        self.continuous_cut = False
+        self.last_cut_pos: Optional[Tuple[float, float]] = None
+        self.cut_radius = 0.0
+        self.cut_max_samples = 0
+        self.cut_defer_rebuild = True
+        self.cut_rebuild_interval = 0.06
+        self.last_rebuild_time = 0.0
         self.mouse_pos: Optional[Tuple[float, float]] = None
         self.selected_idx: Optional[int] = None
         self.quit = False
@@ -36,12 +45,66 @@ class CUDAGLInteractor:
         wy = ymin + (y_ndc + 1) * 0.5 * (ymax - ymin)
         return wx, wy
 
+    def _effective_cut_radius(self) -> float:
+        if self.cut_radius > 0.0:
+            return float(self.cut_radius)
+        return float(getattr(self.so, "edge_len", 0.0)) * 0.75
+
+    def _cut_at(self, wx: float, wy: float):
+        rebuild = not (self.cut_defer_rebuild and self.continuous_cut)
+        radius = self._effective_cut_radius() if self.continuous_cut else float(self.cut_radius)
+        if radius > 0.0:
+            removed = self.so.remove_cells_near(wx, wy, radius, rebuild=rebuild)
+        else:
+            removed = self.so.remove_nearest_cell(wx, wy, rebuild=rebuild)
+        if removed:
+            self.cut_pending = True
+
+    def _cut_along(self, start: Optional[Tuple[float, float]], end: Tuple[float, float]) -> Tuple[float, float]:
+        if start is None:
+            self._cut_at(end[0], end[1])
+            return end
+        radius = self._effective_cut_radius()
+        removed = self.so.remove_cells_along_segment(
+            start[0],
+            start[1],
+            end[0],
+            end[1],
+            radius,
+            rebuild=not self.cut_defer_rebuild,
+        )
+        if removed:
+            self.cut_pending = True
+        return end
+
+    def _maybe_commit_cuts(self):
+        if not getattr(self.so, "_pending_rebuild", False):
+            return
+        now = time.time()
+        if not self.right_down or not self.continuous_cut:
+            if self.so.commit_cuts():
+                self.cut_pending = True
+            self.last_rebuild_time = now
+            return
+        if now - self.last_rebuild_time >= self.cut_rebuild_interval:
+            if self.so.commit_cuts():
+                self.cut_pending = True
+            self.last_rebuild_time = now
+
     def _on_mouse_button(self, window, button, action, mods):
         x, y = glfw.get_cursor_pos(window)
         wx, wy = self._screen_to_world(x, y)
-        if button == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS:
-            if self.so.remove_nearest_cell(wx, wy):
-                self.cut_pending = True
+        if button == glfw.MOUSE_BUTTON_RIGHT:
+            if action == glfw.PRESS:
+                self.right_down = True
+                self.last_cut_pos = (wx, wy)
+                self._cut_at(wx, wy)
+            elif action == glfw.RELEASE:
+                self.right_down = False
+                self.last_cut_pos = None
+                if self.cut_defer_rebuild and self.so.commit_cuts():
+                    self.cut_pending = True
+                    self.last_rebuild_time = time.time()
             return
         if button != glfw.MOUSE_BUTTON_LEFT:
             return
@@ -53,9 +116,11 @@ class CUDAGLInteractor:
             self.mouse_down = False
 
     def _on_cursor(self, window, x, y):
+        wx, wy = self._screen_to_world(x, y)
+        if self.continuous_cut and self.right_down:
+            self.last_cut_pos = self._cut_along(self.last_cut_pos, (wx, wy))
         if not self.mouse_down:
             return
-        wx, wy = self._screen_to_world(x, y)
         self.mouse_pos = (wx, wy)
 
     def _on_key(self, window, key, scancode, action, mods):
@@ -66,6 +131,18 @@ class CUDAGLInteractor:
             self.selected_idx = self.so.find_closest_node(wx, wy)
             if self.selected_idx >= 0 and self.so.toggle_fixed(self.selected_idx):
                 self.cut_pending = True
+            return
+        if key == glfw.KEY_C and action == glfw.PRESS:
+            self.continuous_cut = not self.continuous_cut
+            if not self.continuous_cut:
+                self.last_cut_pos = None
+                if self.cut_defer_rebuild and self.so.commit_cuts():
+                    self.cut_pending = True
+                    self.last_rebuild_time = time.time()
+            elif self.right_down:
+                x, y = glfw.get_cursor_pos(window)
+                wx, wy = self._screen_to_world(x, y)
+                self.last_cut_pos = (wx, wy)
             return
         if key == glfw.KEY_SPACE:
             if action == glfw.PRESS:
@@ -78,6 +155,7 @@ class CUDAGLInteractor:
 
     def process_events(self):
         glfw.poll_events()
+        self._maybe_commit_cuts()
         if glfw.window_should_close(self.renderer.window):
             self.quit = True
 
